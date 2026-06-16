@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+sim_results/
+data/
+*.log
+venv/
+.venv/
+node_modules/
+.cursor/

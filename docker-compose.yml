@@ -1,0 +1,94 @@
+version: "3.9"
+
+services:
+  # ──────────────────
+  # PostgreSQL DB
+  # ──────────────────
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: goodnews
+      POSTGRES_USER: stockuser
+      POSTGRES_PASSWORD: stockpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stockuser -d goodnews"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────
+  # Redis (Celery 브로커)
+  # ──────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ──────────────────
+  # FastAPI 서버
+  # ──────────────────
+  api:
+    build: .
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://stockuser:stockpass@db:5432/goodnews
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  # ──────────────────
+  # Celery Worker
+  # ──────────────────
+  celery_worker:
+    build: .
+    command: celery -A app.scheduler.tasks worker --loglevel=info --concurrency=4
+    environment:
+      DATABASE_URL: postgresql+asyncpg://stockuser:stockpass@db:5432/goodnews
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  # ──────────────────
+  # Celery Beat (스케줄러)
+  # ──────────────────
+  celery_beat:
+    build: .
+    command: celery -A app.scheduler.tasks beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://stockuser:stockpass@db:5432/goodnews
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - celery_worker
+    volumes:
+      - .:/app
+
+volumes:
+  pgdata:

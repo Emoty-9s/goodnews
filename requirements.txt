@@ -1,0 +1,34 @@
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+
+# Database
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.30.0        # PostgreSQL async 드라이버
+# psycopg2-binary==2.9.9 # Celery sync 호환용
+
+# Celery
+celery[redis]==5.4.0
+redis==5.2.0
+
+# HTTP Client
+httpx==0.27.2
+
+# LLM / Embeddings
+google-genai>=1.0.0
+sentence-transformers>=3.0.0
+
+# Settings
+pydantic-settings==2.5.2
+pydantic==2.9.2
+
+# Logging
+loguru==0.7.2
+
+# Dev tools
+python-dotenv==1.0.1
+
+# Universe builder 추가 의존성
+requests==2.32.3
+urllib3==2.2.3
+pyarrow==18.0.0      # parquet 저장 (실패해도 CSV는 정상 동작)

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>리포트 뷰어</title>
+<style>
+  :root {
+    --bg: #faf9f6;
+    --card-bg: #ffffff;
+    --border: #e3e1da;
+    --text: #1f1e1c;
+    --text-secondary: #6b6a65;
+    --bullish-bg: #eaf3de;
+    --bullish-text: #27500a;
+    --bearish-bg: #fcebeb;
+    --bearish-text: #501313;
+    --neutral-bg: #f1efe8;
+    --neutral-text: #444441;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 2rem 1rem 4rem;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 500; margin: 0 0 4px; }
+  .sub { font-size: 14px; color: var(--text-secondary); margin: 0 0 24px; }
+
+  #dropzone {
+    border: 1.5px dashed var(--border);
+    border-radius: 12px;
+    padding: 2.5rem 1rem;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    margin-bottom: 1.5rem;
+  }
+  #dropzone.drag { background: #f0eee6; border-color: #b4b2a9; }
+  #dropzone input { display: none; }
+
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 1.25rem;
+    flex-wrap: wrap;
+  }
+  .toolbar select, .toolbar input[type=text] {
+    font-size: 13px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    color: var(--text);
+  }
+  .toolbar button {
+    font-size: 13px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .toolbar button:hover { background: #f0eee6; }
+  .toolbar .count { font-size: 13px; color: var(--text-secondary); margin-left: auto; }
+
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 20px;
+    margin-bottom: 12px;
+  }
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    gap: 8px;
+  }
+  .card-head-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .ticker {
+    font-weight: 500;
+    font-size: 14px;
+  }
+  .digest-badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 6px;
+    background: var(--neutral-bg);
+    color: var(--neutral-text);
+  }
+  .date {
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .sentiment-badge {
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 10px;
+    border-radius: 8px;
+    white-space: nowrap;
+  }
+  .sentiment-bullish { background: var(--bullish-bg); color: var(--bullish-text); }
+  .sentiment-bearish { background: var(--bearish-bg); color: var(--bearish-text); }
+  .sentiment-neutral, .sentiment-mixed { background: var(--neutral-bg); color: var(--neutral-text); }
+
+  .body-text {
+    font-size: 14px;
+    line-height: 1.65;
+    white-space: pre-wrap;
+  }
+  .body-text strong.section {
+    display: block;
+    font-weight: 500;
+    margin: 10px 0 2px;
+    color: var(--text);
+  }
+  .body-text .bullet-good { color: var(--bullish-text); }
+  .body-text .bullet-bad { color: var(--bearish-text); }
+
+  .sources {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .sources a {
+    color: #185fa5;
+    text-decoration: none;
+    word-break: break-all;
+  }
+  .sources a:hover { text-decoration: underline; }
+
+  .meta-row {
+    display: flex;
+    gap: 14px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 8px;
+    flex-wrap: wrap;
+  }
+
+  .empty {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 14px;
+    padding: 3rem 0;
+  }
+
+  details.raw {
+    margin-top: 10px;
+  }
+  details.raw summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  details.raw pre {
+    font-size: 11px;
+    background: var(--neutral-bg);
+    padding: 10px;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin-top: 6px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>리포트 뷰어</h1>
+  <p class="sub">daily / weekly / midterm JSON 파일을 드래그하거나 클릭해서 불러오세요</p>
+
+  <div id="dropzone">
+    JSON 파일을 여기로 드래그하세요 (여러 개 가능)<br>
+    또는 클릭해서 선택
+    <input type="file" id="fileInput" multiple accept=".json">
+  </div>
+
+  <div class="toolbar" id="toolbar" style="display:none;">
+    <select id="filterTicker"><option value="">전체 종목</option></select>
+    <select id="filterDigest">
+      <option value="">전체 유형</option>
+      <option value="daily">daily</option>
+      <option value="weekly">weekly</option>
+      <option value="midterm">midterm</option>
+    </select>
+    <select id="filterSentiment">
+      <option value="">전체 sentiment</option>
+      <option value="bullish">bullish</option>
+      <option value="bearish">bearish</option>
+      <option value="neutral">neutral</option>
+      <option value="mixed">mixed</option>
+    </select>
+    <button id="sortBtn">날짜순 ↓</button>
+    <button id="clearBtn">초기화</button>
+    <span class="count" id="countLabel"></span>
+  </div>
+
+  <div id="results"></div>
+</div>
+
+<script>
+let allReports = [];
+let sortAsc = false;
+
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const toolbar = document.getElementById('toolbar');
+const results = document.getElementById('results');
+const filterTicker = document.getElementById('filterTicker');
+const filterDigest = document.getElementById('filterDigest');
+const filterSentiment = document.getElementById('filterSentiment');
+const sortBtn = document.getElementById('sortBtn');
+const clearBtn = document.getElementById('clearBtn');
+const countLabel = document.getElementById('countLabel');
+
+dropzone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
+
+['dragenter', 'dragover'].forEach(evt => {
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropzone.classList.add('drag');
+  });
+});
+['dragleave', 'drop'].forEach(evt => {
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropzone.classList.remove('drag');
+  });
+});
+dropzone.addEventListener('drop', (e) => {
+  handleFiles(e.dataTransfer.files);
+});
+
+function handleFiles(fileList) {
+  const files = Array.from(fileList).filter(f => f.name.endsWith('.json'));
+  if (files.length === 0) return;
+
+  let pending = files.length;
+  files.forEach(file => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        ingest(data, file.name);
+      } catch (err) {
+        console.error('parse failed:', file.name, err);
+      }
+      pending--;
+      if (pending === 0) {
+        refreshFilters();
+        render();
+      }
+    };
+    reader.readAsText(file);
+  });
+}
+
+function ingest(data, filename) {
+  const items = Array.isArray(data) ? data : [data];
+  items.forEach(item => {
+    if (!item || typeof item !== 'object') return;
+    allReports.push(normalize(item, filename));
+  });
+}
+
+function normalize(item, filename) {
+  const digestType = item.digest_type || guessDigestFromFilename(filename) || 'unknown';
+  const reportDate = item.report_date || item.week_monday || extractDateFromFilename(filename) || '';
+  return {
+    ticker: item.ticker || guessTickerFromFilename(filename) || '?',
+    digest_type: digestType,
+    version: item.version || '',
+    report_date: reportDate,
+    summary_text: item.summary_text || '',
+    sentiment: item.sentiment || null,
+    source_urls: item.source_urls || [],
+    price_change_pct: (item.price_change_pct !== undefined) ? item.price_change_pct : null,
+    _raw: item,
+    _filename: filename
+  };
+}
+
+function guessDigestFromFilename(name) {
+  if (/daily/i.test(name)) return 'daily';
+  if (/weekly/i.test(name)) return 'weekly';
+  if (/midterm/i.test(name)) return 'midterm';
+  return null;
+}
+function extractDateFromFilename(name) {
+  const m = name.match(/(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : '';
+}
+function guessTickerFromFilename(name) {
+  const m = name.match(/_([A-Z]{1,6})_/);
+  return m ? m[1] : null;
+}
+
+function refreshFilters() {
+  toolbar.style.display = 'flex';
+  const tickers = [...new Set(allReports.map(r => r.ticker))].sort();
+  filterTicker.innerHTML = '<option value="">전체 종목</option>' +
+    tickers.map(t => `<option value="${t}">${t}</option>`).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function formatBody(text) {
+  if (!text) return '';
+  let escaped = escapeHtml(text);
+  escaped = escaped.replace(/^\[(.+?)\]$/gm, '<strong class="section">[$1]</strong>');
+  escaped = escaped.replace(/\[호재\]/g, '<span class="bullet-good">[호재]</span>');
+  escaped = escaped.replace(/\[악재\]/g, '<span class="bullet-bad">[악재]</span>');
+  return escaped;
+}
+
+function sentimentLabel(s) {
+  if (!s) return null;
+  const map = { bullish: '호재', bearish: '악재', neutral: '중립', mixed: '혼조' };
+  return map[s] || s;
+}
+
+function render() {
+  let list = allReports.slice();
+
+  const t = filterTicker.value;
+  const d = filterDigest.value;
+  const s = filterSentiment.value;
+  if (t) list = list.filter(r => r.ticker === t);
+  if (d) list = list.filter(r => r.digest_type === d);
+  if (s) list = list.filter(r => r.sentiment === s);
+
+  list.sort((a, b) => {
+    const da = a.report_date || '';
+    const db = b.report_date || '';
+    return sortAsc ? da.localeCompare(db) : db.localeCompare(da);
+  });
+
+  countLabel.textContent = `${list.length}건`;
+
+  if (list.length === 0) {
+    results.innerHTML = '<div class="empty">표시할 리포트가 없습니다</div>';
+    return;
+  }
+
+  results.innerHTML = list.map(r => {
+    const sentLabel = sentimentLabel(r.sentiment);
+    const sentBadge = sentLabel
+      ? `<span class="sentiment-badge sentiment-${r.sentiment}">${sentLabel}</span>`
+      : '';
+    const sourcesHtml = (r.source_urls && r.source_urls.length)
+      ? `<div class="sources">${r.source_urls.map(u =>
+          `<div><a href="${escapeHtml(u)}" target="_blank" rel="noopener">${escapeHtml(u)}</a></div>`
+        ).join('')}</div>`
+      : '';
+    const priceHtml = (r.price_change_pct !== null && r.price_change_pct !== undefined)
+      ? `<span>${r.price_change_pct >= 0 ? '+' : ''}${Number(r.price_change_pct).toFixed(2)}%</span>`
+      : '';
+    const metaHtml = (priceHtml || r.version)
+      ? `<div class="meta-row">${priceHtml}${r.version ? `<span>${escapeHtml(r.version)}</span>` : ''}</div>`
+      : '';
+
+    return `
+      <div class="card">
+        <div class="card-head">
+          <div class="card-head-left">
+            <span class="ticker">${escapeHtml(r.ticker)}</span>
+            <span class="digest-badge">${escapeHtml(r.digest_type)}</span>
+            <span class="date">${escapeHtml(r.report_date)}</span>
+          </div>
+          ${sentBadge}
+        </div>
+        <div class="body-text">${formatBody(r.summary_text)}</div>
+        ${metaHtml}
+        ${sourcesHtml}
+        <details class="raw">
+          <summary>원본 JSON 보기</summary>
+          <pre>${escapeHtml(JSON.stringify(r._raw, null, 2))}</pre>
+        </details>
+      </div>
+    `;
+  }).join('');
+}
+
+filterTicker.addEventListener('change', render);
+filterDigest.addEventListener('change', render);
+filterSentiment.addEventListener('change', render);
+sortBtn.addEventListener('click', () => {
+  sortAsc = !sortAsc;
+  sortBtn.textContent = sortAsc ? '날짜순 ↑' : '날짜순 ↓';
+  render();
+});
+clearBtn.addEventListener('click', () => {
+  allReports = [];
+  toolbar.style.display = 'none';
+  results.innerHTML = '';
+  fileInput.value = '';
+});
+</script>
+</body>
+</html>
