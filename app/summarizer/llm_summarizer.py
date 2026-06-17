@@ -1,9 +1,11 @@
+import json
 import re
 import time
 
 from google import genai
 from google.genai import types
 from loguru import logger
+from pydantic import BaseModel
 
 from app.core.config import get_settings
 
@@ -26,14 +28,22 @@ def _make_gen_config(
     model: str,
     max_output_tokens: int | None = None,
     temperature: float | None = None,
+    response_schema: type[BaseModel] | None = None,
 ) -> types.GenerateContentConfig:
-    """모델명에서 적절한 GenerateContentConfig 를 생성한다."""
+    """모델명에서 적절한 GenerateContentConfig 를 생성한다.
+
+    response_schema 가 주어지면 Gemini structured output(JSON) 모드로 설정한다.
+    """
     key = "flash-lite" if "flash-lite" in model else "flash"
     defaults = _GEN_CONFIG_DEFAULTS[key]
-    return types.GenerateContentConfig(
+    kwargs = dict(
         max_output_tokens=max_output_tokens or defaults["max_output_tokens"],
         temperature=temperature if temperature is not None else defaults["temperature"],
     )
+    if response_schema is not None:
+        kwargs["response_mime_type"] = "application/json"
+        kwargs["response_schema"] = response_schema
+    return types.GenerateContentConfig(**kwargs)
 
 
 def _generate_content(
@@ -64,6 +74,59 @@ def _generate_content(
                 config=gen_config,
             )
             return (response.text or "").strip()
+        except Exception as e:
+            if "503" in str(e) and attempt < MAX_RETRIES - 1:
+                logger.warning(
+                    f"[{ticker}] Gemini 503 — {RETRY_DELAY}초 후 재시도 "
+                    f"({attempt + 1}/{MAX_RETRIES})"
+                )
+                time.sleep(RETRY_DELAY)
+                continue
+            logger.warning(f"[{ticker}] Gemini 호출 실패: {e}")
+            return None
+
+
+def _generate_structured(
+    prompt: str,
+    schema: type[BaseModel],
+    ticker: str = "",
+    model: str | None = None,
+    max_output_tokens: int | None = None,
+    temperature: float | None = None,
+) -> BaseModel | None:
+    """
+    Gemini structured output(JSON) 호출 + 503 재시도 + 스키마 검증.
+
+    schema:  응답을 강제할 Pydantic 모델. Gemini가 이 스키마에 맞는
+             JSON만 반환하도록 response_schema 로 전달된다.
+    그 외 파라미터는 _generate_content와 동일한 의미.
+
+    반환: schema 인스턴스, 또는 호출/파싱 실패 시 None.
+          (재시도 로직은 _generate_content와 동일하게 503만 재시도)
+    """
+    model = model or settings.gemini_model
+    gen_config = _make_gen_config(
+        model, max_output_tokens, temperature, response_schema=schema
+    )
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=gen_config,
+            )
+            raw = (response.text or "").strip()
+            if not raw:
+                logger.warning(f"[{ticker}] Gemini 구조화 응답 비어있음")
+                return None
+            try:
+                return schema.model_validate(json.loads(raw))
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(
+                    f"[{ticker}] 구조화 응답 파싱/검증 실패: {e} "
+                    f"(raw 앞부분: {raw[:200]!r})"
+                )
+                return None
         except Exception as e:
             if "503" in str(e) and attempt < MAX_RETRIES - 1:
                 logger.warning(
@@ -182,7 +245,7 @@ PROMPT_FULL = """You are a stock news analyst for individual retail investors in
 Rules:
 - ONLY use information from the provided news snippets. No outside knowledge.
 - Do NOT speculate. If something is unclear, say so briefly.
-- Write in Korean. Plain language, no jargon.
+- Write all text values in Korean. Plain language, no jargon.
 - If a news item is clearly unrelated to this ticker, silently ignore it.
 - Sentiment rules:
   * 호재: 주가에 긍정적 영향을 줄 가능성이 높은 뉴스
@@ -209,59 +272,31 @@ Rules:
     구체적 수치/일정/출처가 있으면 → 호재 또는 악재
     막연하거나 출처 불명확하면 → 중립
   * When in doubt → 중립
-- Classify ALL relevant news items.
-- [오늘의 온도차]: Find where positive and negative news collide,
+- Classify ALL relevant news items into positives / negatives / neutral_items.
+  neutral_items also covers sector-wide or macro news with unclear ticker-specific impact.
+- temperature_gap: Find where positive and negative news collide,
   OR explain why the market is moving against the news.
   If no contradiction exists, describe the single dominant theme.
-- [시장 반응 vs 실제 상황]: What is the market reacting to right now?
-  What does the news actually show that the market may not be pricing in?
-  If unclear from snippets, omit this section entirely.
+- checkpoint_section (market_reaction / checkpoint): This is NOT a "market is wrong,
+  here's the truth" contrast. Both fields are simply facts placed side by side:
+  market_reaction is the surface-level reason the market seems to be reacting to,
+  and checkpoint is another fact worth keeping in mind alongside it
+  (e.g. a risk, a detail, a longer-term factor). Do not frame either one as
+  more "correct" than the other — avoid words implying the market's reaction
+  is mistaken or overdone.
+  If this cannot be judged from the snippets, set BOTH fields to null.
+- sentiment_reason: Write as a natural flowing sentence or two, the way an analyst
+  would explain it in conversation. Do NOT prefix it with a label like "근거:"
+  or "이유:" — just state the reasoning directly.
 - Do not include citation numbers like ([1]), ([2]), ([3])
-  in any part of the output. Never reference source numbers.
-- Keep each bullet point concise.
-  Maximum 2 Korean sentences per bullet point.
-- For [주가 영향], use exactly one of these values:
-  호재 우세 / 악재 우세 / 혼조 / 중립
-  This value must match the sentiment field:
-  호재 우세 → bullish
-  악재 우세 → bearish
-  혼조      → mixed
-  중립      → neutral
+  in any field. Never reference source numbers.
+- Each bullet-like string (positives, negatives, neutral_items, next_watch)
+  must be a single self-contained item, maximum 2 Korean sentences.
+- If positives/negatives/neutral_items have nothing to report, return an empty list,
+  NOT a string like "없음".
+- sentiment must be exactly one of: bullish, bearish, mixed, neutral.
 
-Output format:
-
-[오늘의 핵심 한 줄]
-(오늘 이 종목을 한 문장으로)
-
-[호재]
-- (없으면 "없음")
-
-[악재 및 우려]
-- (없으면 "없음")
-
-[중립/섹터]
-- (없으면 "없음")
-
-[오늘의 온도차]
-(호재와 악재가 충돌하는 지점, 또는 시장이 뉴스와 반대로 움직이는 이유.
- 충돌이 없으면 오늘 뉴스의 지배적 흐름 1-2줄)
-
-[시장 반응 vs 실제 상황]
-시장 반응: (1문장)
-실제 상황: (1문장)
-(판단 불가 시 섹션 전체 생략)
-
-[주가 영향] 호재 우세 / 악재 우세 / 혼조 / 중립
-근거: (1-2문장, 스니펫 기반)
-
-[투자자 관점]
-단기: (1문장)
-장기: (1문장)
-
-[다음에 주목할 뉴스]
-- (후속 뉴스 1)
-- (후속 뉴스 2)
-- (후속 뉴스 3)
+Respond with a single JSON object matching the required schema. No prose outside JSON.
 
 ---
 Ticker: {ticker}
@@ -271,176 +306,334 @@ News snippets:
 
 
 # ──────────────────────────────────────────
+# PROMPT_FULL 구조화 출력 스키마 + 고정 템플릿 렌더링
+#
+# LLM은 아래 FullReportData 필드만 채우고, 헤더/순서/문구/구두점은
+# render_full_report()가 고정 템플릿으로 조립한다.
+# (지금까지의 [오늘의 핵심 한 줄] 등 출력 형식을 그대로 유지하므로
+#  downstream — DB 저장, weekly 입력 — 은 변경 없이 호환된다.)
+# ──────────────────────────────────────────
+
+class CheckpointSection(BaseModel):
+    """시장 반응과 함께 봐야 할 체크포인트.
+
+    '시장 반응 vs 실제 상황' 같은 대비/반박 구도가 아니라,
+    시장이 보고 있는 표면적 이유와 동시에 같이 챙겨봐야 할 사실을
+    나란히 제시하는 섹션. 어느 쪽이 '맞다'는 판단은 하지 않는다.
+    """
+    market_reaction: str | None = None
+    checkpoint: str | None = None
+
+
+class InvestorView(BaseModel):
+    short_term: str
+    long_term: str
+
+
+class FullReportData(BaseModel):
+    headline: str
+    positives: list[str] = []
+    negatives: list[str] = []
+    neutral_items: list[str] = []
+    temperature_gap: str
+    checkpoint_section: CheckpointSection | None = None
+    sentiment: str  # bullish / bearish / mixed / neutral
+    sentiment_reason: str
+    investor_view: InvestorView
+    next_watch: list[str] = []
+
+
+_SENTIMENT_TO_LABEL = {
+    "bullish": "호재 우세",
+    "bearish": "악재 우세",
+    "mixed": "혼조",
+    "neutral": "중립",
+}
+
+
+def _dedup_keep_order(items: list[str]) -> list[str]:
+    """리스트 내 완전 중복 문자열 제거(순서 유지). 공백 차이는 무시하고 비교."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        key = item.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def render_full_report(data: FullReportData) -> str:
+    """
+    FullReportData → 고정 템플릿 마크다운 텍스트.
+
+    기존 PROMPT_FULL이 LLM에게 직접 쓰게 했던 출력 형식과
+    글자 단위로 동일한 골격을 만든다. 값이 비어 있을 때의 처리
+    (예: "없음")도 여기서 결정론적으로 처리한다.
+    """
+    positives = _dedup_keep_order(data.positives)
+    negatives = _dedup_keep_order(data.negatives)
+    neutral_items = _dedup_keep_order(data.neutral_items)
+    next_watch = _dedup_keep_order(data.next_watch)
+
+    lines: list[str] = []
+    lines.append("[오늘의 핵심 한 줄]")
+    lines.append(data.headline.strip())
+    lines.append("")
+
+    lines.append("[호재]")
+    lines.extend(f"- {x}" for x in positives) if positives else lines.append("- 없음")
+    lines.append("")
+
+    lines.append("[악재 및 우려]")
+    lines.extend(f"- {x}" for x in negatives) if negatives else lines.append("- 없음")
+    lines.append("")
+
+    lines.append("[중립/매크로]")
+    lines.extend(f"- {x}" for x in neutral_items) if neutral_items else lines.append("- 없음")
+    lines.append("")
+
+    lines.append("[오늘의 온도차]")
+    lines.append(data.temperature_gap.strip())
+    lines.append("")
+
+    cps = data.checkpoint_section
+    if cps is not None and cps.market_reaction and cps.checkpoint:
+        lines.append("[시장 반응과 체크포인트]")
+        lines.append(f"시장 반응: {cps.market_reaction.strip()}")
+        lines.append(f"체크포인트: {cps.checkpoint.strip()}")
+        lines.append("")
+
+    sentiment_label = _SENTIMENT_TO_LABEL.get(data.sentiment, "중립")
+    lines.append(f"[주가 영향] {sentiment_label}")
+    lines.append(data.sentiment_reason.strip())
+    lines.append("")
+
+    lines.append("[투자자 관점]")
+    lines.append(f"단기: {data.investor_view.short_term.strip()}")
+    lines.append(f"장기: {data.investor_view.long_term.strip()}")
+    lines.append("")
+
+    lines.append("[다음에 체크해야 할 뉴스]")
+    if next_watch:
+        lines.extend(f"- {x}" for x in next_watch)
+    else:
+        lines.append("- 없음")
+
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────
+# 주간 리포트 — 구조화 출력 스키마 + 고정 템플릿 렌더링
+#
+# daily(PROMPT_FULL)와 동일한 방식: LLM은 WeeklyReportData 필드만
+# 채우고, 헤더/순서/불릿 형식/구두점은 render_weekly_report()가
+# 고정 템플릿으로 조립한다.
+#
+# 카테고리는 호재/악재가 따로 쓰던 카테고리명을 5개로 통합했다.
+# sentiment(positive/negative)와 category를 독립된 필드로 받으므로
+# midterm 등 후속 단계에서 텍스트 정규식 없이 바로 집계할 수 있다.
+# ──────────────────────────────────────────
+
+WEEKLY_CATEGORIES = [
+    "실적_재무",   # 어닝, 매출, 가이던스, 마진
+    "사업_운영",   # 계약, 파트너십, 신제품, FDA, 리콜, 생산중단, 소송
+    "시장평가",    # 목표주가, 투자의견, 커버리지
+    "경영_인사",   # CEO/경영진 변화, 자사주매입, 배당, 구조조정
+    "거시_섹터",   # 규제, 정책, 업황, 관세, 조사
+]
+
+
+class CategorizedItem(BaseModel):
+    content: str
+    category: str  # WEEKLY_CATEGORIES 중 하나
+
+
+class WeeklyReportData(BaseModel):
+    headline: str
+    weekly_flow: str
+    positives: list[CategorizedItem] = []
+    positives_interpretation: str | None = None
+    negatives: list[CategorizedItem] = []
+    negatives_interpretation: str | None = None
+    sentiment_start: str | None = None   # bullish/bearish/mixed/neutral, 주초
+    sentiment_end: str | None = None     # bullish/bearish/mixed/neutral, 주말
+    temperature_reason: str | None = None
+    next_watch: list[str] = []
+    sentiment: str            # 이번 주 종합 판단. bullish/bearish/mixed/neutral
+    sentiment_reason: str
+
+
+_CATEGORY_LABEL = {c: c.replace("_", "/") for c in WEEKLY_CATEGORIES}
+
+
+def _dedup_categorized_keep_order(items: list[CategorizedItem]) -> list[CategorizedItem]:
+    """content 완전 중복 제거(순서 유지, 공백 차이 무시)."""
+    seen: set[str] = set()
+    result: list[CategorizedItem] = []
+    for item in items:
+        key = item.content.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _render_categorized_section(
+    header: str,
+    items: list[CategorizedItem],
+    interpretation: str | None,
+    lines: list[str],
+) -> None:
+    """[호재]/[악재 및 우려] 공통 렌더링. 항목 없으면 섹션 전체 생략."""
+    deduped = _dedup_categorized_keep_order(items)
+    if not deduped:
+        return
+    lines.append(header)
+    for item in deduped:
+        label = _CATEGORY_LABEL.get(item.category, item.category)
+        lines.append(f"• {item.content.strip()} (카테고리: {label})")
+    if interpretation:
+        lines.append(f"→ 해석: {interpretation.strip()}")
+    lines.append("")
+
+
+def render_weekly_report(data: WeeklyReportData) -> str:
+    """
+    WeeklyReportData → 고정 템플릿 마크다운 텍스트.
+
+    기존 PROMPT_WEEKLY_* 가 LLM에게 직접 쓰게 했던 출력 형식과
+    동일한 골격(헤더/불릿/구두점)을 유지한다. 값이 없을 때의 처리
+    (섹션 생략 등)도 여기서 결정론적으로 처리한다.
+    """
+    next_watch = []
+    seen_watch: set[str] = set()
+    for x in data.next_watch:
+        key = x.strip()
+        if key and key not in seen_watch:
+            seen_watch.add(key)
+            next_watch.append(x)
+
+    lines: list[str] = []
+    lines.append("[이번 주 핵심 한 줄]")
+    lines.append(data.headline.strip())
+    lines.append("")
+
+    lines.append("[주간 흐름]")
+    lines.append(data.weekly_flow.strip())
+    lines.append("")
+
+    _render_categorized_section("[호재]", data.positives, data.positives_interpretation, lines)
+    _render_categorized_section("[악재 및 우려]", data.negatives, data.negatives_interpretation, lines)
+
+    if data.sentiment_start and data.sentiment_end and data.temperature_reason:
+        lines.append("[주간 온도 변화]")
+        lines.append(f"{data.sentiment_start} 시작 → {data.sentiment_end} 마감")
+        lines.append(data.temperature_reason.strip())
+        lines.append("")
+
+    lines.append("[다음 주 체크해야 할 뉴스]")
+    if next_watch:
+        lines.extend(f"- {x}" for x in next_watch)
+    else:
+        lines.append("- 없음")
+    lines.append("")
+
+    sentiment_label = _SENTIMENT_TO_LABEL.get(data.sentiment, "중립")
+    lines.append(f"[이번 주 종합 판단] {sentiment_label}")
+    lines.append(data.sentiment_reason.strip())
+
+    return "\n".join(lines)
+
+
+_WEEKLY_SCHEMA_RULES = """
+- positives/negatives: 각 항목은 {{"content": "...", "category": "..."}} 형태.
+  category는 다음 5개 중 정확히 하나여야 합니다: 실적_재무, 사업_운영, 시장평가, 경영_인사, 거시_섹터
+  - 실적_재무: 어닝 비트/미스, 매출 증가/감소, 가이던스 상향/하향, 마진 변화
+  - 사업_운영: 계약/파트너십 체결(금액 명시), 신제품 출시, FDA 승인, 리콜, 생산 중단, 소송
+  - 시장평가: 목표주가 상향/하향, 투자의견 업/다운그레이드, 커버리지 개시
+  - 경영_인사: CEO/핵심 인력 변화, 자사주 매입, 배당 변경, 구조조정
+  - 거시_섹터: 규제 강화/완화, 관세, 정책, 업황, 조사 착수
+- positives/negatives에 해당 내용이 없으면 빈 리스트를 반환하세요 (억지로 채우지 마세요).
+- positives_interpretation/negatives_interpretation: 해당 리스트가 비어있지 않을 때만 작성.
+  어느 방향에서 온 이슈인지, 단기/구조적인지, 전체 흐름에 주는 의미를 2~3문장으로.
+  리스트가 비어있으면 null로 두세요.
+- sentiment_start/sentiment_end/temperature_reason: 주초→주말 sentiment 변화를
+  판단할 근거가 부족하면 셋 다 null로 두세요. 판단 가능하면 셋 다 채우세요.
+  sentiment_start/sentiment_end는 bullish/bearish/mixed/neutral 중 하나.
+- next_watch: 아래 두 조건을 모두 충족하는 항목만 포함하세요.
+  ① 제공된 자료 본문에 명시적으로 언급된 내용
+  ② 구체적인 날짜 또는 이벤트명이 있는 것
+  조건 미충족 시 빈 리스트로 두세요.
+- sentiment(이번 주 종합 판단)는 bullish/bearish/mixed/neutral 중 정확히 하나.
+- "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현 금지.
+- Do not include citation numbers like ([1]), ([2]) in any field.
+- sentiment_reason은 "근거:" 같은 라벨 없이 자연스러운 문장으로 쓰세요.
+
+Respond with a single JSON object matching the required schema. No prose outside JSON.
+"""
+
+
+# ──────────────────────────────────────────
 # 주간 리포트 프롬프트
 # ──────────────────────────────────────────
 
-PROMPT_WEEKLY_FROM_DAILIES = """
+PROMPT_WEEKLY_FROM_DAILIES = ("""
 당신은 미국 주식 뉴스를 분석하는 전문 애널리스트입니다.
 아래는 [{ticker}] 종목의 이번 주 일간 리포트 목록입니다.
 
 === 이번 주 일간 리포트 ===
 {daily_reports}
 
-위 일간 리포트들을 바탕으로 주간 리포트를 작성하세요.
+위 일간 리포트들을 바탕으로 주간 리포트 데이터를 JSON으로 작성하세요.
 
 ───────────────────────────────
 작성 규칙 (반드시 준수)
 ───────────────────────────────
-1. 모든 내용은 위에 제공된 일간 리포트에 근거해야 합니다.
-2. 수치(금액, %, 날짜)는 리포트에 명시된 것만 사용하세요.
-3. 추측이나 일반적 상식으로 내용을 채우지 마세요.
-4. 호재/악재가 없으면 해당 섹션을 생략하세요. 억지로 채우지 마세요.
-5. 여러 일간 리포트에 같은 이슈가 반복되면 가장 최신/구체적인 것 하나만 사용하세요.
-6. "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현을 쓰지 마세요.
-7. [다음 주 주목할 뉴스] 섹션은 아래 3가지를 모두 충족할 때만 작성하세요:
-   ① 일간 리포트 본문에 명시적으로 언급된 내용
-   ② 구체적인 날짜 또는 이벤트명이 있는 것
-   ③ 위 두 조건 미충족 시 섹션 전체를 생략하세요.
-
-───────────────────────────────
-출력 형식 (마크다운, 한국어)
-───────────────────────────────
-
-[이번 주 핵심 한 줄]
-한 주 전체를 관통하는 가장 중요한 이슈를 1문장으로 작성.
-월간/연간 리포트에서 이 주를 한 줄로 요약할 때 사용됩니다.
-
-[주간 흐름]
-주초 → 중반 → 주말 순서로 스토리 전개를 서술하세요.
-요일을 나열하는 것이 아니라 분위기와 맥락의 변화를 중심으로 작성하세요.
-예) "주초 거시 불안으로 약세 출발 → 중반 실적 대기 속 관망 → 주말 어닝 서프라이즈로 반전"
-
-[호재]
-※ 아래 카테고리 중 해당하는 것만 작성. 없으면 섹션 전체 생략.
-
-카테고리 기준:
-- 실적/재무: 어닝 비트, 매출 성장, 가이던스 상향, 수익 개선
-- 사업/계약: 계약 체결(금액 명시), 파트너십, 신제품 출시, FDA 승인
-- 시장평가: 목표주가 상향, 투자의견 업그레이드, 커버리지 개시(Buy)
-- 경영/전략: 자사주 매입, 배당 증가, 구조조정 효과
-- 거시/섹터: 규제 완화, 업황 개선, 정책 수혜
-
-형식:
-• [내용] (카테고리: OOO)
-• [내용] (카테고리: OOO)
-
-→ 해석: 어느 방향에서 온 호재인지, 한 방향이면 그 의미를,
-        여러 방향이면 각각의 의미와 전체 흐름을 2~3문장으로 설명하세요.
-
-[악재 및 우려]
-※ 아래 카테고리 중 해당하는 것만 작성. 없으면 섹션 전체 생략.
-
-카테고리 기준:
-- 실적/재무: 어닝 미스, 매출 감소, 가이던스 하향, 수익 악화
-- 사업/운영: 리콜, 생산 중단, 계약 해지, 제품 결함, 소송 제기
-- 시장평가: 목표주가 하향, 투자의견 다운그레이드
-- 경영/인사: CEO 돌연 사임, 핵심 인력 이탈
-- 거시/규제: 규제 강화, 관세, 조사 착수, 벌금 부과
-
-형식:
-• [내용] (카테고리: OOO)
-• [내용] (카테고리: OOO)
-
-→ 해석: 어느 방향에서 온 악재인지, 단기적 이슈인지 구조적 문제인지,
-        여러 방향이면 각각의 의미와 전체적인 리스크 수준을 2~3문장으로 설명하세요.
-
-[주간 온도 변화]
-주초 sentiment → 주말 sentiment 변화를 한 줄로 표현한 후,
-그 변화의 원인과 의미를 2~3문장으로 설명하세요.
-예) "bearish 시작 → bullish 마감: 관세 우려로 약세 출발했으나 예상을 상회한
-    실적 발표가 분위기를 반전시켰으며, 애널리스트 목표주가 상향이 이를 뒷받침."
-
-[다음 주 주목할 뉴스]
-※ 작성 조건: 일간 리포트 본문에 명시적으로 언급 + 구체적 날짜/이벤트명 있을 때만 작성.
-  두 조건 중 하나라도 미충족 시 이 섹션 전체를 생략하세요.
-
-[이번 주 종합 판단]
-주간 sentiment: 호재 우세 → bullish / 악재 우세 → bearish / 그 외 → neutral
-근거: 판단의 핵심 이유를 한 줄로.
-※ 주말 분위기에 가중치를 두세요 (주말 흐름이 다음 주에 영향을 주므로).
-"""
+- 모든 내용은 위에 제공된 일간 리포트에 근거해야 합니다.
+- 수치(금액, %, 날짜)는 리포트에 명시된 것만 사용하세요.
+- 추측이나 일반적 상식으로 내용을 채우지 마세요.
+- 여러 일간 리포트에 같은 이슈가 반복되면 가장 최신/구체적인 것 하나만 사용하세요.
+- weekly_flow: 주초 → 중반 → 주말 순서로 스토리 전개를 서술하세요.
+  요일을 나열하는 것이 아니라 분위기와 맥락의 변화를 중심으로 작성하세요.
+  예) "주초 거시 불안으로 약세 출발 → 중반 실적 대기 속 관망 → 주말 어닝 서프라이즈로 반전"
+- sentiment_start/sentiment_end는 주초/주말 분위기를 반영하고,
+  주말(금요일) 분위기에 좀 더 가중치를 두어 최종 sentiment를 판단하세요
+  (주말 흐름이 다음 주에 영향을 주므로).
+""" + _WEEKLY_SCHEMA_RULES + """
+---
+Ticker: {ticker}
+""").strip()
 
 
-PROMPT_WEEKLY_FROM_ARTICLES = """
+PROMPT_WEEKLY_FROM_ARTICLES = ("""
 당신은 미국 주식 뉴스를 분석하는 전문 애널리스트입니다.
 아래는 [{ticker}] 종목의 이번 주 수집된 뉴스 목록입니다.
 
 === 이번 주 뉴스 ===
 {articles}
 
-위 뉴스들을 바탕으로 주간 리포트를 작성하세요.
+위 뉴스들을 바탕으로 주간 리포트 데이터를 JSON으로 작성하세요.
 
 ───────────────────────────────
 작성 규칙 (반드시 준수)
 ───────────────────────────────
-1. 모든 내용은 위에 제공된 뉴스에 근거해야 합니다.
-2. 수치(금액, %, 날짜)는 뉴스에 명시된 것만 사용하세요.
-3. 추측이나 일반적 상식으로 내용을 채우지 마세요.
-4. 호재/악재가 없으면 해당 섹션을 생략하세요. 억지로 채우지 마세요.
-5. 뉴스가 적을 경우(1~3건) 있는 내용만 작성하고,
-   [이번 주 핵심 한 줄]과 [이번 주 종합 판단]은 반드시 포함하세요.
-6. "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현을 쓰지 마세요.
-7. [다음 주 주목할 뉴스] 섹션은 아래 3가지를 모두 충족할 때만 작성하세요:
-   ① 뉴스 본문에 명시적으로 언급된 내용
-   ② 구체적인 날짜 또는 이벤트명이 있는 것
-   ③ 위 두 조건 미충족 시 섹션 전체를 생략하세요.
-
-───────────────────────────────
-출력 형식 (마크다운, 한국어)
-───────────────────────────────
-
-[이번 주 핵심 한 줄]
-이번 주 가장 중요한 이슈를 1문장으로 작성.
-
-[주간 흐름]
-뉴스 발생 순서를 바탕으로 이번 주 스토리 전개를 서술하세요.
-뉴스가 적으면 있는 내용 중심으로 간략하게 작성하세요.
-
-[호재]
-※ 없으면 섹션 전체 생략.
-
-카테고리 기준:
-- 실적/재무: 어닝 비트, 매출 성장, 가이던스 상향
-- 사업/계약: 계약 체결(금액 명시), 파트너십, 신제품 출시, FDA 승인
-- 시장평가: 목표주가 상향, 투자의견 업그레이드
-- 경영/전략: 자사주 매입, 배당 증가
-- 거시/섹터: 규제 완화, 업황 개선
-
-형식:
-• [내용] (카테고리: OOO)
-
-→ 해석: 어느 방향에서 온 호재인지 2~3문장으로 설명.
-
-[악재 및 우려]
-※ 없으면 섹션 전체 생략.
-
-카테고리 기준:
-- 실적/재무: 어닝 미스, 매출 감소, 가이던스 하향
-- 사업/운영: 리콜, 생산 중단, 소송, 제품 결함
-- 시장평가: 목표주가 하향, 투자의견 다운그레이드
-- 경영/인사: CEO 사임, 핵심 인력 이탈
-- 거시/규제: 규제 강화, 조사 착수, 벌금
-
-형식:
-• [내용] (카테고리: OOO)
-
-→ 해석: 어느 방향에서 온 악재인지, 단기/구조적 문제인지 2~3문장으로 설명.
-
-[주간 온도 변화]
-※ 뉴스가 2건 이상일 때만 작성. 1건이면 생략.
-이번 주 분위기 변화를 한 줄로 표현 후 2~3문장 설명.
-
-[다음 주 주목할 뉴스]
-※ 뉴스 본문에 명시 + 구체적 날짜/이벤트명 있을 때만 작성.
-  조건 미충족 시 섹션 전체 생략.
-
-[이번 주 종합 판단]
-주간 sentiment: 호재 우세 → bullish / 악재 우세 → bearish / 그 외 → neutral
-근거: 판단의 핵심 이유를 한 줄로.
-"""
+- 모든 내용은 위에 제공된 뉴스에 근거해야 합니다.
+- 수치(금액, %, 날짜)는 뉴스에 명시된 것만 사용하세요.
+- 추측이나 일반적 상식으로 내용을 채우지 마세요.
+- 뉴스가 적을 경우(1~3건)에도 headline과 sentiment/sentiment_reason은 반드시 작성하세요.
+- weekly_flow: 뉴스 발생 순서를 바탕으로 이번 주 스토리 전개를 서술하세요.
+  뉴스가 적으면 있는 내용 중심으로 간략하게 작성하세요.
+- sentiment_start/sentiment_end/temperature_reason: 뉴스가 2건 미만이면 셋 다 null로 두세요.
+""" + _WEEKLY_SCHEMA_RULES + """
+---
+Ticker: {ticker}
+""").strip()
 
 
-PROMPT_WEEKLY_UPDATE = """
+PROMPT_WEEKLY_UPDATE = ("""
 당신은 미국 주식 뉴스를 분석하는 전문 애널리스트입니다.
 아래는 [{ticker}] 종목의 주간 리포트 초안과 이번 주 추가된 일간 리포트입니다.
 
@@ -450,53 +643,23 @@ PROMPT_WEEKLY_UPDATE = """
 === 이번 주 추가된 일간 리포트 (월~금) ===
 {daily_reports}
 
-초안을 이번 주 전체 내용으로 업데이트해서 최종 주간 리포트를 작성하세요.
+초안을 이번 주 전체 내용으로 업데이트해서 최종 주간 리포트 데이터를 JSON으로 작성하세요.
 
 ───────────────────────────────
 작성 규칙 (반드시 준수)
 ───────────────────────────────
-1. 초안의 내용을 기반으로 이번 주 일간 리포트를 통합하세요.
-2. 초안과 일간 리포트에 같은 이슈가 있으면 가장 최신/구체적인 것만 사용하세요.
-3. 모든 수치(금액, %, 날짜)는 제공된 리포트에 명시된 것만 사용하세요.
-4. 추측이나 일반적 상식으로 내용을 채우지 마세요.
-5. 호재/악재가 없으면 해당 섹션을 생략하세요.
-6. [다음 주 주목할 뉴스]는 리포트 본문에 명시 + 구체적 날짜/이벤트명 있을 때만 작성.
-7. 주간 sentiment는 주말(금요일) 분위기에 가중치를 두세요.
-
-───────────────────────────────
-출력 형식 (마크다운, 한국어)
-───────────────────────────────
-
-[이번 주 핵심 한 줄]
-한 주 전체를 관통하는 가장 중요한 이슈를 1문장으로.
-초안보다 이번 주 전체 흐름을 더 잘 반영하도록 업데이트하세요.
-
-[주간 흐름]
-주초 → 중반 → 주말 전체 흐름을 서술.
-초안의 주초 내용 + 이번 주 추가 내용을 통합하세요.
-
-[호재]
-※ 없으면 섹션 전체 생략.
-• [내용] (카테고리: OOO)
-→ 해석: 2~3문장
-
-[악재 및 우려]
-※ 없으면 섹션 전체 생략.
-• [내용] (카테고리: OOO)
-→ 해석: 2~3문장
-
-[주간 온도 변화]
-주초(월요일 전후) → 주말(금요일) sentiment 변화와 그 원인.
-
-[다음 주 주목할 뉴스]
-※ 리포트 본문에 명시 + 구체적 날짜/이벤트명 있을 때만 작성.
-  조건 미충족 시 섹션 전체 생략.
-
-[이번 주 종합 판단]
-주간 sentiment: bullish / bearish / neutral
-근거: 판단의 핵심 이유를 한 줄로.
-※ 금요일 마감 분위기에 가중치.
-"""
+- 초안의 내용을 기반으로 이번 주 일간 리포트를 통합하세요.
+- 초안과 일간 리포트에 같은 이슈가 있으면 가장 최신/구체적인 것만 사용하세요.
+- 모든 수치(금액, %, 날짜)는 제공된 리포트에 명시된 것만 사용하세요.
+- 추측이나 일반적 상식으로 내용을 채우지 마세요.
+- headline: 초안보다 이번 주 전체 흐름을 더 잘 반영하도록 업데이트하세요.
+- weekly_flow: 주초 → 중반 → 주말 전체 흐름을 서술. 초안의 주초 내용 + 이번 주 추가 내용을 통합하세요.
+- sentiment_start는 주초(월요일 전후), sentiment_end는 주말(금요일) 기준이며,
+  금요일 마감 분위기에 가중치를 두어 최종 sentiment를 판단하세요.
+""" + _WEEKLY_SCHEMA_RULES + """
+---
+Ticker: {ticker}
+""").strip()
 
 
 # ──────────────────────────────────────────
@@ -504,6 +667,17 @@ PROMPT_WEEKLY_UPDATE = """
 # ──────────────────────────────────────────
 
 def select_prompt(news_count: int) -> str:
+    """
+    뉴스 건수로 PROMPT_SIMPLE/PROMPT_FULL 중 어느 템플릿 문자열을 쓸지 결정.
+
+    주의: PROMPT_FULL은 JSON 구조화 출력(response_schema=FullReportData)
+    전용 프롬프트로 바뀌었으므로, 이 함수가 반환한 PROMPT_FULL을
+    그냥 텍스트 모드(_generate_content)로 호출하면 안 된다.
+    summarize_ticker / summarize_update는 이 함수를 쓰지 않고
+    news_count <= 4 여부를 직접 분기해 적절한 생성 함수
+    (_generate_content vs _generate_structured)를 선택한다.
+    이 함수는 과거 호환/참고용으로만 남겨둔다.
+    """
     if news_count <= 4:
         return PROMPT_SIMPLE
     return PROMPT_FULL
@@ -512,6 +686,9 @@ def select_prompt(news_count: int) -> str:
 # ──────────────────────────────────────────
 # 메인 요약 함수
 # ──────────────────────────────────────────
+
+_VALID_SENTIMENTS = {"bullish", "bearish", "mixed", "neutral"}
+
 
 def summarize_ticker(ticker: str, news_list: list[dict], digest_type: str) -> dict | None:
     if not news_list:
@@ -526,13 +703,24 @@ def summarize_ticker(ticker: str, news_list: list[dict], digest_type: str) -> di
     logger.info(f"[{ticker}] {digest_type} 요약 시작 ({len(news_list)}건)")
 
     news_input = build_news_input(news_list)
-    prompt = select_prompt(len(news_list)).format(ticker=ticker, news_input=news_input)
 
-    summary_text = _generate_content(prompt, ticker, model=settings.gemini_model_lite)
-    if summary_text is None:
-        return None
-
-    sentiment = parse_sentiment(summary_text)
+    # 뉴스 4건 이하 → PROMPT_SIMPLE (자유 텍스트, 기존 방식 그대로)
+    # 뉴스 5건 이상 → PROMPT_FULL (JSON 구조화 출력 + 고정 템플릿 렌더링)
+    if len(news_list) <= 4:
+        prompt = PROMPT_SIMPLE.format(ticker=ticker, news_input=news_input)
+        summary_text = _generate_content(prompt, ticker, model=settings.gemini_model_lite)
+        if summary_text is None:
+            return None
+        sentiment = parse_sentiment(summary_text)
+    else:
+        prompt = PROMPT_FULL.format(ticker=ticker, news_input=news_input)
+        data = _generate_structured(
+            prompt, FullReportData, ticker, model=settings.gemini_model_lite,
+        )
+        if data is None:
+            return None
+        sentiment = data.sentiment if data.sentiment in _VALID_SENTIMENTS else "neutral"
+        summary_text = render_full_report(data)
 
     return {
         "ticker": ticker,
@@ -615,38 +803,37 @@ def summarize_update(ticker: str, existing_report, new_articles: list[dict]) -> 
             existing_report=existing_report,
             news_input=news_input,
         )
+        summary_text = _generate_content(prompt, ticker, model=settings.gemini_model_lite)
+        if summary_text is None:
+            return None
+        sentiment = parse_sentiment(summary_text)
+    elif len(new_articles) <= 4:
+        prompt = PROMPT_SIMPLE.format(ticker=ticker, news_input=news_input)
+        summary_text = _generate_content(prompt, ticker, model=settings.gemini_model_lite)
+        if summary_text is None:
+            return None
+        sentiment = parse_sentiment(summary_text)
     else:
-        prompt = select_prompt(len(new_articles)).format(
-            ticker=ticker, news_input=news_input
+        # existing_report 없음 + 새 기사 5건 이상 → PROMPT_FULL(JSON 구조화)
+        prompt = PROMPT_FULL.format(ticker=ticker, news_input=news_input)
+        data = _generate_structured(
+            prompt, FullReportData, ticker, model=settings.gemini_model_lite,
         )
-
-    summary_text = _generate_content(prompt, ticker, model=settings.gemini_model_lite)
-    if summary_text is None:
-        return None
+        if data is None:
+            return None
+        sentiment = data.sentiment if data.sentiment in _VALID_SENTIMENTS else "neutral"
+        summary_text = render_full_report(data)
 
     return {
         "summary_text": summary_text,
-        "sentiment": parse_sentiment(summary_text),
+        "sentiment": sentiment,
         "source_urls": source_urls,
     }
 
 
 # ──────────────────────────────────────────
-# 주간 리포트: sentiment 파싱 / 입력 포맷
+# 주간 리포트: 입력 포맷 (daily → weekly)
 # ──────────────────────────────────────────
-
-def parse_weekly_sentiment(summary_text: str) -> str:
-    """
-    [이번 주 종합 판단] 섹션에서 bullish/bearish/neutral 추출.
-    섹션을 찾으면 해당 구간에서, 못 찾으면 전체에서 첫 매칭을 사용.
-    """
-    section = summary_text
-    m = re.search(r"\[이번 주 종합 판단\](.*)", summary_text, re.DOTALL)
-    if m:
-        section = m.group(1)
-    m2 = re.search(r"\b(bullish|bearish|neutral)\b", section, re.IGNORECASE)
-    return m2.group(1).lower() if m2 else "neutral"
-
 
 def _format_daily_reports(daily_reports: list[dict]) -> str:
     """일간 리포트 리스트를 프롬프트용 텍스트 블록으로 변환."""
@@ -698,76 +885,12 @@ def _dedup_daily_bullets(reports_text: str, max_dupes: int = 2) -> str:
     return "\n".join(result)
 
 
-# 반복 감지용 섹션 헤더 패턴
-_REPEAT_SECTION_RE = re.compile(
-    r"(\[호재\]|\[악재 및 우려\]|\[호재/악재 추세\])",
-    re.IGNORECASE,
-)
-
-
-def validate_response(text: str, ticker: str = "") -> str:
-    """
-    LLM 응답 후처리 — 반복 폭주 감지 및 잘라내기.
-
-    [호재] / [악재 및 우려] 섹션 내 불릿 항목의 첫 10단어가 동일한 패턴이
-    3회 이상 연속되면, 해당 지점 이후를 잘라내고 경고 한 줄을 추가한다.
-    전체 텍스트 길이가 15,000자 초과 시에도 무조건 잘라낸다(하드캡).
-    """
-    HARD_CAP = 15_000
-    REPEAT_THRESHOLD = 3
-
-    # 하드캡
-    if len(text) > HARD_CAP:
-        logger.warning(
-            f"[{ticker}] 응답 길이 {len(text):,}자 — 하드캡 {HARD_CAP}자로 잘라냄"
-        )
-        text = text[:HARD_CAP] + "\n\n*(응답이 너무 길어 자동으로 잘렸습니다)*"
-
-    lines = text.split("\n")
-    result: list[str] = []
-    # 섹션 진입 후 불릿 fingerprint 카운터
-    in_section = False
-    bullet_fp_count: dict[str, int] = {}
-
-    for i, line in enumerate(lines):
-        # 섹션 헤더 진입
-        if _REPEAT_SECTION_RE.search(line):
-            in_section = True
-            bullet_fp_count = {}
-            result.append(line)
-            continue
-
-        # 다른 섹션 헤더 → 리셋
-        if line.startswith("[") and line.endswith("]") and line != lines[0]:
-            in_section = False
-            bullet_fp_count = {}
-
-        if in_section:
-            stripped = line.lstrip()
-            is_bullet = stripped and stripped[0] in ("•", "-", "*") and len(stripped) > 3
-            if is_bullet:
-                words = re.split(r"\s+", stripped[1:].strip())
-                fp = " ".join(w.lower() for w in words[:10])
-                cnt = bullet_fp_count.get(fp, 0) + 1
-                bullet_fp_count[fp] = cnt
-                if cnt > REPEAT_THRESHOLD:
-                    logger.warning(
-                        f"[{ticker}] 반복 불릿 {cnt}회 감지 (fp='{fp[:40]}…') "
-                        f"— 이후 내용 잘라냄 (line {i})"
-                    )
-                    result.append(
-                        "\n*(동일 항목 반복 감지 — 이후 내용 생략됨)*"
-                    )
-                    break
-
-        result.append(line)
-
-    return "\n".join(result)
-
-
 # ──────────────────────────────────────────
 # 주간 리포트 생성 (월요일 초안)
 # ──────────────────────────────────────────
+
+_VALID_WEEKLY_SENTIMENTS = {"bullish", "bearish", "mixed", "neutral"}
+
 
 def summarize_weekly(
     ticker: str,
@@ -782,6 +905,9 @@ def summarize_weekly(
     2. daily_reports 1~2개    → PROMPT_WEEKLY_FROM_ARTICLES (원본 뉴스 보완)
     3. daily_reports 없음     → PROMPT_WEEKLY_FROM_ARTICLES (원본 뉴스만)
     4. 둘 다 없음             → None 반환 (스킵)
+
+    LLM은 WeeklyReportData(JSON)만 채우고, 헤더/순서/불릿 형식은
+    render_weekly_report()가 고정 템플릿으로 조립한다.
 
     반환: {"summary_text": ..., "sentiment": ...} 또는 None
     """
@@ -815,18 +941,18 @@ def summarize_weekly(
         f"(daily {len(daily_reports)}건 / articles {len(raw_articles)}건)"
     )
 
-    summary_text = _generate_content(
-        prompt, ticker,
+    data = _generate_structured(
+        prompt, WeeklyReportData, ticker,
         model=settings.gemini_model_lite,
         max_output_tokens=3000,
     )
-    if summary_text is None:
+    if data is None:
         return None
 
-    summary_text = validate_response(summary_text, ticker)
+    sentiment = data.sentiment if data.sentiment in _VALID_WEEKLY_SENTIMENTS else "neutral"
     return {
-        "summary_text": summary_text,
-        "sentiment": parse_weekly_sentiment(summary_text),
+        "summary_text": render_weekly_report(data),
+        "sentiment": sentiment,
     }
 
 
@@ -860,18 +986,18 @@ def summarize_weekly_update(
         f"[{ticker}] weekly 최종본 업데이트 시작 (daily {len(daily_reports)}건)"
     )
 
-    summary_text = _generate_content(
-        prompt, ticker,
+    data = _generate_structured(
+        prompt, WeeklyReportData, ticker,
         model=settings.gemini_model_lite,
         max_output_tokens=3000,
     )
-    if summary_text is None:
+    if data is None:
         return None
 
-    summary_text = validate_response(summary_text, ticker)
+    sentiment = data.sentiment if data.sentiment in _VALID_WEEKLY_SENTIMENTS else "neutral"
     return {
-        "summary_text": summary_text,
-        "sentiment": parse_weekly_sentiment(summary_text),
+        "summary_text": render_weekly_report(data),
+        "sentiment": sentiment,
     }
 
 
@@ -944,45 +1070,118 @@ def parse_sector_sentiment(section: str) -> str:
 
 
 # ──────────────────────────────────────────
-# 연간 리포트용 주간 데이터 추출 헬퍼
-# ──────────────────────────────────────────
-
-def extract_weekly_headline(summary_text: str) -> str:
-    """[이번 주 핵심 한 줄] 섹션의 본문 한 줄 추출. 없으면 빈 문자열."""
-    m = re.search(r"\[이번 주 핵심 한 줄\]\s*\n(.+)", summary_text)
-    return m.group(1).strip() if m else ""
-
-
-def extract_sector_theme(summary_text: str) -> str:
-    """섹터 뉴스 리포트의 '핵심 테마: ...' 한 줄 추출. 없으면 빈 문자열."""
-    m = re.search(r"핵심 테마:\s*(.+)", summary_text)
-    return m.group(1).strip() if m else ""
-
-
-def extract_next_week_watch(summary_text: str) -> str | None:
-    """[다음 주 주목할 뉴스] 섹션 본문 추출. 섹션 없으면 None."""
-    m = re.search(
-        r"\[다음 주 주목할 뉴스\]\s*\n(.+?)(?=\n\[|\Z)", summary_text, re.DOTALL
-    )
-    if not m:
-        return None
-    content = m.group(1).strip()
-    return content if content else None
-
-
-
-# ──────────────────────────────────────────
 # 중장기(Midterm) 리포트 — 최근 12주 집계
 # ──────────────────────────────────────────
 
-PROMPT_MIDTERM = """
+# Midterm 구조화 출력 스키마 + 고정 템플릿 렌더링
+# daily(FullReportData)/weekly(WeeklyReportData)와 동일한 방식.
+
+class MidtermReportData(BaseModel):
+    headline: str
+    flow_narrative: str
+    trend_items: list[CategorizedItem] = []
+    trend_interpretation: str | None = None
+    benchmark_interpretation: str
+    sector_comparison: str | None = None
+    sentiment: str            # bullish/bearish/mixed/neutral
+    sentiment_reason: str
+
+
+def render_midterm_report(
+    data: MidtermReportData,
+    sector_name: str,
+    exchange: str,
+    stock_cumulative: float,
+    sp500_cumulative: float,
+    sector_cumulative: float,
+    alpha_vs_market: float,
+    alpha_vs_sector: float,
+) -> str:
+    """
+    MidtermReportData → 고정 템플릿 마크다운 텍스트.
+    [누적 성과 vs 벤치마크]의 숫자 줄은 LLM 출력이 아니라
+    이 함수가 직접 포맷팅한다.
+    """
+    lines: list[str] = []
+    lines.append("[중장기 핵심 한 줄]")
+    lines.append(data.headline.strip())
+    lines.append("")
+
+    lines.append("[중장기 흐름]")
+    lines.append(data.flow_narrative.strip())
+    lines.append("")
+
+    deduped = _dedup_categorized_keep_order(data.trend_items)
+    if deduped:
+        lines.append("[호재/악재 추세]")
+        for item in deduped:
+            label = _CATEGORY_LABEL.get(item.category, item.category)
+            lines.append(f"• {item.content.strip()} (카테고리: {label})")
+        if data.trend_interpretation:
+            lines.append(f"→ 해석: {data.trend_interpretation.strip()}")
+        lines.append("")
+
+    lines.append("[누적 성과 vs 벤치마크]")
+    lines.append(f"이 종목 누적 수익률: {stock_cumulative:+.2f}%")
+    lines.append(f"S&P500 누적 수익률: {sp500_cumulative:+.2f}%")
+    lines.append(f"{sector_name} 섹터({exchange}) 누적 수익률: {sector_cumulative:+.2f}%")
+    lines.append(f"시장 대비 alpha: {alpha_vs_market:+.2f}%p")
+    lines.append(f"섹터 대비 alpha: {alpha_vs_sector:+.2f}%p")
+    lines.append("")
+    lines.append(data.benchmark_interpretation.strip())
+    lines.append("")
+
+    if data.sector_comparison:
+        lines.append("[종목 vs 섹터 흐름 비교]")
+        lines.append(data.sector_comparison.strip())
+        lines.append("")
+
+    sentiment_label = _SENTIMENT_TO_LABEL.get(data.sentiment, "중립")
+    lines.append(f"[중장기 종합 판단] {sentiment_label}")
+    lines.append(data.sentiment_reason.strip())
+
+    return "\n".join(lines)
+
+
+_MIDTERM_SCHEMA_RULES = """
+- trend_items: 각 항목은 {{"content": "...", "category": "..."}} 형태.
+  category는 다음 5개 중 정확히 하나여야 합니다: 실적_재무, 사업_운영, 시장평가, 경영_인사, 거시_섹터
+  - 실적_재무: 어닝, 매출, 가이던스, 마진 변화
+  - 사업_운영: 계약/파트너십, 신제품, FDA, 리콜, 생산 중단, 소송
+  - 시장평가: 목표주가, 투자의견, 커버리지
+  - 경영_인사: CEO/핵심 인력, 자사주 매입, 배당, 구조조정
+  - 거시_섹터: 규제, 정책, 업황, 관세, 조사
+- trend_items에 해당 내용이 없으면 빈 리스트를 반환하세요 (억지로 채우지 마세요).
+- trend_interpretation: trend_items가 비어있지 않을 때만 작성. 비어있으면 null.
+  반복/증가/감소한 이슈를 2~3문장으로 요약하세요.
+- benchmark_interpretation: 누적 성과에 대한 해석 문장만 작성하세요.
+  숫자(%, %p)는 이 필드에 직접 적지 마세요 — 최종 출력의 숫자 줄은 시스템이 자동 삽입합니다.
+  참고용 사전 계산값은 해석할 때만 활용하세요.
+- sector_comparison 작성 시 주의:
+  ① 주차/날짜를 하나씩 나열하면서 설명하지 마세요
+     (예: "1월 26일 주간에는 ~였으나 2월 9일 주간에는 ~" 같은 형식 금지).
+  ② "과거에는 ~했지만 최근에는 ~로 바뀌었다" 같은 시간 흐름 전개도 쓰지 마세요.
+  ③ 제공된 기간 전체를 한 덩어리로 보고, 지금 종목과 섹터가 어떤
+     관계인지(동조하고 있는지, 종목만 따로 움직이는지, 비교할 자료가
+     부족한지)를 짧은 문단으로 진단하듯 쓰세요.
+  ④ 섹터 뉴스가 있는 주차가 하나도 없으면 null로 두세요.
+- sentiment: bullish/bearish/mixed/neutral 중 정확히 하나.
+- sentiment_reason: alpha + sentiment 추세를 종합한 한 줄. "근거:" 라벨 없이 자연스러운 문장으로.
+- "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현 금지.
+- Do not include citation numbers like ([1]), ([2]) in any field.
+
+Respond with a single JSON object matching the required schema. No prose outside JSON.
+"""
+
+
+PROMPT_MIDTERM = ("""
 당신은 미국 주식 뉴스를 분석하는 전문 애널리스트입니다.
 아래는 [{ticker}] 종목의 최근 {week_count}주간 데이터입니다.
 
 === 주간 리포트 시퀀스 (과거 → 최근) ===
 {weekly_reports}
 
-=== 누적 성과 (사전 계산됨) ===
+=== 누적 성과 (참고용 사전 계산값 — 해석할 때만 활용, 출력 필드에 직접 적지 마세요) ===
 이 종목 누적 수익률: {stock_cumulative}%
 S&P500 누적 수익률: {sp500_cumulative}%
 {sector_name} 섹터({exchange}) 누적 수익률: {sector_cumulative}%
@@ -992,45 +1191,21 @@ S&P500 누적 수익률: {sp500_cumulative}%
 === 같은 기간 {sector_name} 섹터 주간 뉴스 ===
 {sector_news}
 
-위 데이터를 바탕으로 중장기 리포트를 작성하세요.
+위 데이터를 바탕으로 중장기 리포트 데이터를 JSON으로 작성하세요.
 
 ───────────────────────────────
 작성 규칙 (반드시 준수)
 ───────────────────────────────
-1. 모든 내용은 제공된 주간 리포트/섹터 뉴스에 근거해야 합니다. 추측 금지.
-2. 누적 성과 수치는 위에 제공된 값을 그대로 사용하세요. 직접 계산하지 마세요.
-3. "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현 금지.
-4. 섹터 뉴스가 없는 주는 [종목 vs 섹터 흐름 비교] 비교에서 제외하세요.
-5. 호재 또는 악재가 전혀 없었으면 [호재/악재 추세] 섹션 전체를 생략하세요.
-
-───────────────────────────────
-출력 형식 (마크다운, 한국어)
-───────────────────────────────
-[중장기 핵심 한 줄]
-최근 {week_count}주를 관통하는 가장 중요한 흐름을 1문장으로.
-
-[중장기 흐름]
-주차별 스토리를 변곡점 중심으로 서술. 단순 나열 금지.
-(예: "1~3주차 실적 기대감 → 4주차 발표 후 반전 → 5~6주차 안정")
-
-[호재/악재 추세]
-주간 리포트들의 (카테고리: OOO) 태그를 바탕으로
-반복/증가/감소한 이슈 분석.
-호재 또는 악재가 없었으면 섹션 전체 생략.
-
-[누적 성과 vs 벤치마크]
-사전계산된 수치를 인용하며 해석.
-시장/섹터 대비 초과 또는 부진 여부, 이유를 흐름과 연결.
-
-[종목 vs 섹터 흐름 비교]
-이 종목의 주간 sentiment 흐름과 섹터 뉴스의 sentiment 흐름을 비교.
-동조/디커플링 구간을 구분해서 설명.
-섹터 뉴스가 없는 주는 비교에서 제외.
-
-[중장기 종합 판단]
-sentiment: bullish / bearish / neutral
-근거: alpha + sentiment 추세를 종합한 한 줄.
-"""
+- 모든 내용은 제공된 주간 리포트/섹터 뉴스에 근거해야 합니다. 추측 금지.
+- 사전 계산된 수치는 해석(benchmark_interpretation)에서만 참고하고,
+  JSON 출력 필드에 %/%p 숫자를 직접 적지 마세요.
+- "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현 금지.
+- flow_narrative: 주차별 스토리를 변곡점 중심으로 서술. 단순 나열 금지.
+  (예: "1~3주차 실적 기대감 → 4주차 발표 후 반전 → 5~6주차 안정")
+""" + _MIDTERM_SCHEMA_RULES + """
+---
+Ticker: {ticker}
+""").strip()
 
 
 def _calc_cumulative(series: list) -> float:
@@ -1068,18 +1243,6 @@ def _format_sector_news_for_midterm(sector_news: list[dict]) -> str:
         body = item.get("summary_text") or ""
         blocks.append(f"--- {wm} [{sentiment}] ---\n{body}")
     return "\n\n".join(blocks)
-
-
-def parse_midterm_sentiment(summary_text: str) -> str:
-    """[중장기 종합 판단] 섹션에서 bullish/bearish/neutral 추출."""
-    section = summary_text
-    m = re.search(r"\[중장기 종합 판단\](.*)", summary_text, re.DOTALL)
-    if m:
-        section = m.group(1)
-    for kw in ("bullish", "bearish", "neutral"):
-        if kw in section.lower():
-            return kw
-    return "neutral"
 
 
 def _build_midterm_template(
@@ -1161,13 +1324,25 @@ def summarize_midterm(
 
     logger.info(f"[{ticker}] midterm 요약 시작 ({week_count}주 기반)")
 
-    summary_text = _generate_content(prompt, ticker)
-    if summary_text is None:
+    data = _generate_structured(prompt, MidtermReportData, ticker)
+    if data is None:
         return None
+
+    sentiment = data.sentiment if data.sentiment in _VALID_WEEKLY_SENTIMENTS else "neutral"
+    summary_text = render_midterm_report(
+        data,
+        sector_name,
+        exchange,
+        stock_cumulative,
+        sp500_cumulative,
+        sector_cumulative,
+        alpha_vs_market,
+        alpha_vs_sector,
+    )
 
     return {
         "summary_text": summary_text,
-        "sentiment": parse_midterm_sentiment(summary_text),
+        "sentiment": sentiment,
         "price_change_pct": stock_cumulative,
     }
 
