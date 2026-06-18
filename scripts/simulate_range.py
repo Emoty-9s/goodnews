@@ -143,17 +143,12 @@ class DryRunContext:
         self._by_digest: dict[str, dict] = {}
         # current active digest_type (set just before each summarize call)
         self.active_digest_type: str = "unknown"
-
-        # ── dry-run 메모리 저장소 ──
-        # midterm 트리거 판단·입력 구성 시 DB 대신 이 값들을 참조한다.
-        # 키: ticker(대문자) -> {week_monday(date): record(dict)}
-        self.weekly_finals: dict[str, dict[date, dict]] = {}
-        self.midterms: dict[str, dict[date, dict]] = {}
-        # 키: week_monday(date) -> record(dict)
-        self.benchmarks: dict[date, dict] = {}
-        # 키: (sector_name, week_monday) -> record(dict)
-        self.sector_news: dict[tuple, dict] = {}
-
+        # dry-run 내에서 생성한 weekly final을 메모리에도 보관
+        # (운영 DB에는 안 쓰지만, midterm이 같은 시뮬레이션 내 데이터를
+        #  참조할 수 있게 하기 위함). key: (ticker, week_monday) → dict
+        self._weekly_finals: dict[tuple[str, date], dict] = {}
+        # midterm을 생성한 (ticker, week_monday) 기록 (get_last_midterm_date 대체용)
+        self._midterm_dates: dict[str, list[date]] = {}
 
     # ── LLM 사용량 기록 ──
 
@@ -221,18 +216,9 @@ class DryRunContext:
         if price_change_pct is not None:
             data["price_change_pct"] = price_change_pct
         self._write(path, data)
-
-        # final 결과는 메모리에도 보관 (midterm 트리거 판단에 사용)
+        # midterm이 같은 시뮬레이션 내에서 참조할 수 있도록 final만 메모리에도 보관
         if version == "final":
-            key = ticker.upper()
-            if key not in self.weekly_finals:
-                self.weekly_finals[key] = {}
-            self.weekly_finals[key][week_monday] = {
-                "week_monday": week_monday,
-                "summary_text": summary_text,
-                "sentiment": sentiment,
-                "price_change_pct": price_change_pct,
-            }
+            self._weekly_finals[(ticker, week_monday)] = data
 
     def save_midterm(
         self,
@@ -250,17 +236,40 @@ class DryRunContext:
             "sentiment": sentiment,
             "price_change_pct": price_change_pct,
         })
+        self._midterm_dates.setdefault(ticker, []).append(week_monday)
 
-        # 메모리 기록 (다음 midterm 트리거 판단용 get_last_midterm_date)
-        key = ticker.upper()
-        if key not in self.midterms:
-            self.midterms[key] = {}
-        self.midterms[key][week_monday] = {
-            "week_monday": week_monday,
-            "summary_text": summary_text,
-            "sentiment": sentiment,
-            "price_change_pct": price_change_pct,
-        }
+    def has_weekly_final_local(self, ticker: str, week_monday: date) -> bool:
+        """dry-run 메모리에 해당 (ticker, week_monday) final이 있는지 확인.
+        운영 DB 함수 has_weekly_final()의 dry-run 버전."""
+        return (ticker, week_monday) in self._weekly_finals
+
+    def get_last_midterm_date_local(self, ticker: str) -> date | None:
+        """dry-run 메모리에서 해당 ticker의 가장 최근 midterm 생성일을 반환.
+        운영 DB 함수 get_last_midterm_date()의 dry-run 버전."""
+        dates = self._midterm_dates.get(ticker)
+        return max(dates) if dates else None
+
+    def get_recent_weekly_finals_local(
+        self, ticker: str, before: date,
+    ) -> list[dict]:
+        """dry-run 메모리에서 해당 ticker의 weekly final을 반환.
+        운영 DB 함수 get_recent_weekly_finals_for_midterm()의 dry-run 버전.
+
+        DB 함수와 동일한 조건:
+          - 날짜 범위: (before - 84일) <= week_monday <= before  (양쪽 포함)
+          - 정렬: week_monday ASC (오래된 것부터)
+          - 반환 필드: week_monday, summary_text, sentiment, price_change_pct
+        """
+        since = before - timedelta(days=84)
+        # week_monday를 키(date)로 덮어써서 DB 반환값과 타입을 일치시킴
+        # (save_weekly가 data["week_monday"]를 str로 저장하므로 변환 필요)
+        items = [
+            {**v, "week_monday": wm}
+            for (t, wm), v in self._weekly_finals.items()
+            if t == ticker and since <= wm <= before
+        ]
+        items.sort(key=lambda r: r["week_monday"])
+        return items
 
     def save_sector_news(self, week_monday: date, sector_summaries: dict) -> None:
         path = self.out_dir / "sector_news" / f"{week_monday}.json"
@@ -268,15 +277,6 @@ class DryRunContext:
             "week_monday": str(week_monday),
             "categories": sector_summaries,
         })
-
-        # 메모리 기록 — 카테고리별로 (category, week_monday) 키로 저장
-        # (midterm 입력 구성 시 get_sector_news_series 보완)
-        for category, data in sector_summaries.items():
-            self.sector_news[(category, week_monday)] = {
-                "week_monday": week_monday,
-                "summary_text": data.get("summary_text", ""),
-                "sentiment": data.get("sentiment", "neutral"),
-            }
 
     def save_benchmark(
         self,
@@ -292,46 +292,6 @@ class DryRunContext:
                 f"{sec}|{exch}": pct for (sec, exch), pct in sector_changes.items()
             },
         })
-
-        # 메모리 기록 (midterm 입력 구성 시 get_weekly_benchmarks_series 보완)
-        self.benchmarks[week_monday] = {
-            "week_monday": week_monday,
-            "sp500": sp500_change,
-            "sectors": sector_changes,  # {(sector, exchange): pct} 원형 보존
-        }
-
-    # ── 메모리 조회 헬퍼 (midterm 트리거 판단 / 입력 구성에 사용) ──
-
-    def has_weekly_final_local(self, ticker: str, week_monday: date) -> bool:
-        """해당 주차의 weekly final 이 로컬 메모리에 있는지 확인."""
-        return week_monday in self.weekly_finals.get(ticker.upper(), {})
-
-    def get_last_midterm_date_local(self, ticker: str) -> date | None:
-        """로컬에 저장된 midterm 중 가장 최근 week_monday 반환. 없으면 None."""
-        dates = self.midterms.get(ticker.upper(), {}).keys()
-        return max(dates) if dates else None
-
-    def get_recent_weekly_finals_local(self, ticker: str, before: date) -> list[dict]:
-        """before 기준 최근 12주(84일) 이내의 weekly final 레코드를 과거→최근 정렬로 반환."""
-        since = before - timedelta(days=84)
-        records = self.weekly_finals.get(ticker.upper(), {})
-        selected = [v for wm, v in records.items() if since <= wm <= before]
-        selected.sort(key=lambda r: r["week_monday"])
-        return selected
-
-    def get_benchmarks_local(self, week_mondays: list[date]) -> dict[date, dict]:
-        """주어진 week_monday 목록 중 로컬 메모리에 있는 벤치마크만 반환."""
-        return {wm: self.benchmarks[wm] for wm in week_mondays if wm in self.benchmarks}
-
-    def get_sector_news_local(self, sector: str, week_mondays: list[date]) -> list[dict]:
-        """주어진 섹터/주차 중 로컬 메모리에 있는 sector_news를 week_monday 순으로 반환."""
-        result = [
-            self.sector_news[(sector, wm)]
-            for wm in week_mondays
-            if (sector, wm) in self.sector_news
-        ]
-        result.sort(key=lambda r: r["week_monday"])
-        return result
 
     # ── 최종 집계 출력 & 저장 ──
 
@@ -424,7 +384,7 @@ async def sim_daily_closing(
 
     if ctx:
         ctx.active_digest_type = "daily"
-    result = summarize_ticker(ticker, articles, "daily")
+    result = await asyncio.to_thread(summarize_ticker, ticker, articles, "daily")
     if result is None:
         return "fail"
 
@@ -467,7 +427,9 @@ async def sim_weekly_draft(
 
     if ctx:
         ctx.active_digest_type = "weekly_draft"
-    summary = summarize_weekly(ticker, daily_reports=dailies, raw_articles=raw)
+    summary = await asyncio.to_thread(
+        summarize_weekly, ticker, daily_reports=dailies, raw_articles=raw
+    )
     if summary is None:
         return "fail"
 
@@ -505,18 +467,21 @@ async def sim_weekly_final(
         ctx.active_digest_type = "weekly_final"
 
     if draft:
-        summary = summarize_weekly_update(
+        summary = await asyncio.to_thread(
+            summarize_weekly_update,
             ticker=ticker,
             draft_report=draft["summary_text"],
             daily_reports=this_week_dailies,
         )
     elif this_week_dailies:
-        summary = summarize_weekly(ticker, daily_reports=this_week_dailies)
+        summary = await asyncio.to_thread(
+            summarize_weekly, ticker, daily_reports=this_week_dailies
+        )
     else:
         raw = await get_articles_for_ticker_between(ticker, since_dt, until_dt)
         if not raw:
             return "skip"
-        summary = summarize_weekly(ticker, raw_articles=raw)
+        summary = await asyncio.to_thread(summarize_weekly, ticker, raw_articles=raw)
 
     if summary is None:
         return "fail"
@@ -604,46 +569,26 @@ async def sim_midterm(
     중장기 리포트 생성. 반환: "ok" / "skip" / "template" / "fail"
 
     dry_run=True 이면 DB upsert 대신 로컬 파일에 저장.
-    ctx 가 있으면:
-      - LLM 사용량 추적 (active_digest_type 설정)
-      - 트리거 판단·입력 구성 시 운영 DB 결과에 ctx 로컬 메모리를 병합
-        (같은 dry-run 안에서 만든 weekly final / benchmark / sector_news 반영)
-    ctx가 없는 운영 경로(스케줄러)는 기존 동작과 완전히 동일하다.
+    ctx 가 있으면 LLM 사용량 추적을 위해 active_digest_type 을 설정한다.
     """
     prev_monday = week_monday - timedelta(days=7)
 
-    # ── 1. 트리거 판단 ──
-    this_has_final = await has_weekly_final(ticker, week_monday)
-    prev_has_final = await has_weekly_final(ticker, prev_monday)
-    last_mid = await get_last_midterm_date(ticker)
-
-    if ctx:
-        # dry-run 로컬 결과를 OR 병합 (DB에 없어도 로컬에 있으면 인정)
-        this_has_final = this_has_final or ctx.has_weekly_final_local(ticker, week_monday)
-        prev_has_final = prev_has_final or ctx.has_weekly_final_local(ticker, prev_monday)
-        local_last_mid = ctx.get_last_midterm_date_local(ticker)
-        if local_last_mid is not None and (last_mid is None or local_last_mid > last_mid):
-            last_mid = local_last_mid
+    if dry_run and ctx:
+        this_has_final = ctx.has_weekly_final_local(ticker, week_monday)
+        prev_has_final = ctx.has_weekly_final_local(ticker, prev_monday)
+        last_mid = ctx.get_last_midterm_date_local(ticker)
+    else:
+        this_has_final = await has_weekly_final(ticker, week_monday)
+        prev_has_final = await has_weekly_final(ticker, prev_monday)
+        last_mid = await get_last_midterm_date(ticker)
 
     if not should_generate_midterm(ticker, week_monday, this_has_final, prev_has_final, last_mid):
         return "skip"
 
-    # ── 2. 최근 12주 weekly final 병합 ──
-    weekly_reports = await get_recent_weekly_finals_for_midterm(ticker, before=week_monday)
-
-    if ctx:
-        local_reports = ctx.get_recent_weekly_finals_local(ticker, before=week_monday)
-        if local_reports:
-            # week_monday(date) 기준 dict 생성 후 로컬 결과로 덮어쓰기
-            merged: dict[date, dict] = {}
-            for r in weekly_reports:
-                wm = _as_date(r["week_monday"])
-                merged[wm] = {**r, "week_monday": wm}
-            for r in local_reports:
-                wm = _as_date(r["week_monday"])
-                merged[wm] = {**r, "week_monday": wm}
-            weekly_reports = [merged[k] for k in sorted(merged)]
-
+    if dry_run and ctx:
+        weekly_reports = ctx.get_recent_weekly_finals_local(ticker, before=week_monday)
+    else:
+        weekly_reports = await get_recent_weekly_finals_for_midterm(ticker, before=week_monday)
     if not weekly_reports:
         return "skip"
 
@@ -652,48 +597,17 @@ async def sim_midterm(
         return "skip"
     sector_name, exchange = sector_info
 
-    week_mondays = [_as_date(r["week_monday"]) for r in weekly_reports]
-
-    # ── 3. 벤치마크 병합 ──
+    week_mondays = [
+        _as_date(r["week_monday"]) for r in weekly_reports
+    ]
     benchmarks = await get_weekly_benchmarks_series(week_mondays, sector_name, exchange)
-
-    if ctx:
-        local_bm = ctx.get_benchmarks_local(week_mondays)
-        if local_bm:
-            sp500_list  = list(benchmarks["sp500"])
-            sector_list = list(benchmarks["sector"])
-            for i, wm in enumerate(week_mondays):
-                lb = local_bm.get(wm)
-                if lb is None:
-                    continue
-                if sp500_list[i] is None:
-                    sp500_list[i] = lb.get("sp500")
-                if sector_list[i] is None:
-                    # sectors 키: {(sector_name, exchange): pct}
-                    sector_list[i] = lb.get("sectors", {}).get((sector_name, exchange))
-            benchmarks = {"sp500": sp500_list, "sector": sector_list}
-
-    # ── 4. 섹터 뉴스 병합 ──
     sector_news = await get_sector_news_series(sector_name, week_mondays)
 
     if ctx:
-        local_sn = ctx.get_sector_news_local(sector_name, week_mondays)
-        if local_sn:
-            # week_monday 기준 dict → 로컬로 덮어쓰거나 추가
-            sn_map: dict[date, dict] = {}
-            for r in sector_news:
-                wm = _as_date(r["week_monday"])
-                sn_map[wm] = {**r, "week_monday": wm}
-            for r in local_sn:
-                wm = _as_date(r["week_monday"])
-                sn_map[wm] = {**r, "week_monday": wm}
-            sector_news = [sn_map[k] for k in sorted(sn_map)]
-
-    # ── 5. LLM 호출 ──
-    if ctx:
         ctx.active_digest_type = "midterm"
 
-    result = summarize_midterm(
+    result = await asyncio.to_thread(
+        summarize_midterm,
         ticker=ticker,
         weekly_reports=weekly_reports,
         sp500_series=benchmarks["sp500"],
@@ -705,7 +619,6 @@ async def sim_midterm(
     if result is None:
         return "skip"
 
-    # ── 6. 저장 ──
     if dry_run and ctx:
         ctx.save_midterm(
             ticker, week_monday,
@@ -727,6 +640,34 @@ async def sim_midterm(
 # 메인 루프
 # ──────────────────────────────────────────
 
+async def _run_per_ticker(
+    tickers: list[str],
+    coro_fn,
+    stats_key: str,
+    stats: dict,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    """
+    tickers 전체에 대해 coro_fn(ticker)를 동시에 실행한다.
+    semaphore로 동시 실행 개수를 제한해 Gemini RPM / DB 커넥션 풀을 보호한다.
+    개별 종목 실패가 전체를 막지 않도록 예외를 잡아 'fail'로 집계한다.
+    """
+    async def _one(ticker: str) -> None:
+        async with semaphore:
+            try:
+                r = await coro_fn(ticker)
+            except Exception as e:
+                logger.warning(f"[{stats_key}][{ticker}] 예외 발생 (fail 처리): {e}")
+                r = "fail"
+            if stats_key == "midterm" and r == "template":
+                stats["midterm"]["template"] += 1
+                stats["midterm"]["ok"] += 1
+            else:
+                _bump(stats, stats_key, r)
+
+    await asyncio.gather(*(_one(t) for t in tickers))
+
+
 async def run(
     start: date,
     end: date,
@@ -734,6 +675,7 @@ async def run(
     do_sector_news: bool = True,
     do_midterm: bool = True,
     ctx: "DryRunContext | None" = None,
+    concurrency: int = 10,
 ):
     stats: dict = {
         "daily": _new_stats(),
@@ -742,26 +684,37 @@ async def run(
         "midterm": {**_new_stats(), "template": 0},
     }
 
+    semaphore = asyncio.Semaphore(concurrency)
+
     if ctx:
         logger.info(f"[DRY-RUN] 출력 폴더: {ctx.out_dir}")
+    logger.info(f"[병렬 실행] 동시성 제한: {concurrency}개")
 
     cur = start
     while cur <= end:
         weekday = cur.weekday()  # 0=월 ... 6=일
         logger.info(f"\n===== {cur.isoformat()} ({WEEKDAY_KR[weekday]}) =====")
 
-        # 1) Daily closing - 매일
-        for ticker in tickers:
-            r = await sim_daily_closing(ticker, cur, ctx)
-            _bump(stats, "daily", r)
+        # 1) Daily closing - 매일 (종목 동시 실행)
+        if ctx:
+            ctx.active_digest_type = "daily"
+        await _run_per_ticker(
+            tickers,
+            lambda t: sim_daily_closing(t, cur, ctx),
+            "daily", stats, semaphore,
+        )
         logger.info(f"[DAILY] {cur} 누적: {stats['daily']}")
 
-        # 2) Weekly draft - 월요일
+        # 2) Weekly draft - 월요일 (종목 동시 실행)
         if weekday == 0:
             week_monday = cur
-            for ticker in tickers:
-                r = await sim_weekly_draft(ticker, week_monday, ctx)
-                _bump(stats, "weekly_draft", r)
+            if ctx:
+                ctx.active_digest_type = "weekly_draft"
+            await _run_per_ticker(
+                tickers,
+                lambda t: sim_weekly_draft(t, week_monday, ctx),
+                "weekly_draft", stats, semaphore,
+            )
             logger.info(f"[WEEKLY-DRAFT] {week_monday} 누적: {stats['weekly_draft']}")
 
         # 3) Weekly final - 금요일 (+가격 벤치마크, +섹터뉴스)
@@ -783,31 +736,24 @@ async def run(
                 tickers, week_monday, week_friday
             )
 
-            for ticker in tickers:
-                r = await sim_weekly_final(ticker, week_monday, week_friday, price_changes, ctx)
-                _bump(stats, "weekly_final", r)
+            if ctx:
+                ctx.active_digest_type = "weekly_final"
+            await _run_per_ticker(
+                tickers,
+                lambda t: sim_weekly_final(t, week_monday, week_friday, price_changes, ctx),
+                "weekly_final", stats, semaphore,
+            )
             logger.info(f"[WEEKLY-FINAL] {week_monday} 누적: {stats['weekly_final']}")
-
-            # 실제 운영 스케줄 순서 준수:
-            # weekly-final(21:00) → weekly-sector-news(21:30) → weekly-midterm(22:00)
-            # midterm이 이번 주 sector_news를 입력으로 쓸 수 있도록 sector_news를 먼저 실행
-            if do_sector_news:
-                n = await sim_weekly_sector_news(week_monday, week_friday, ctx)
-                logger.info(f"[SECTOR-NEWS] {week_monday}: {n}개 카테고리 생성")
 
             if do_midterm:
                 dry_run = ctx is not None
-                for ticker in tickers:
-                    try:
-                        r = await sim_midterm(ticker, week_monday, dry_run=dry_run, ctx=ctx)
-                    except Exception as e:
-                        logger.warning(f"[MIDTERM][{ticker}] 실패 (스킵): {e}")
-                        r = "fail"
-                    if r == "template":
-                        stats["midterm"]["template"] += 1
-                        stats["midterm"]["ok"] += 1
-                    else:
-                        _bump(stats, "midterm", r)
+                if ctx:
+                    ctx.active_digest_type = "midterm"
+                await _run_per_ticker(
+                    tickers,
+                    lambda t: sim_midterm(t, week_monday, dry_run=dry_run, ctx=ctx),
+                    "midterm", stats, semaphore,
+                )
                 logger.info(
                     f"[MIDTERM] {week_monday} 누적: "
                     f"ok={stats['midterm']['ok']} "
@@ -815,6 +761,10 @@ async def run(
                     f"skip={stats['midterm']['skip']} "
                     f"fail={stats['midterm']['fail']}"
                 )
+
+            if do_sector_news:
+                n = await sim_weekly_sector_news(week_monday, week_friday, ctx)
+                logger.info(f"[SECTOR-NEWS] {week_monday}: {n}개 카테고리 생성")
 
         cur += timedelta(days=1)
 
@@ -851,6 +801,11 @@ def main():
         "--dry-run", action="store_true",
         help="운영 DB에 쓰지 않고 sim_results/dry_run_*/에 로컬 파일로 저장",
     )
+    parser.add_argument(
+        "--concurrency", type=int, default=10,
+        help="종목 단위 동시 LLM 호출 수 (기본 10). Gemini Tier 1이면 10~20 권장. "
+             "503/429 에러가 잦으면 낮추고, 여유 있으면 올리세요.",
+    )
     args = parser.parse_args()
 
     start = date.fromisoformat(args.start)
@@ -884,6 +839,7 @@ def main():
             do_sector_news=not args.no_sector_news,
             do_midterm=not args.no_midterm,
             ctx=ctx,
+            concurrency=args.concurrency,
         )
     )
 

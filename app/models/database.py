@@ -1,5 +1,6 @@
 import hashlib
 import json
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -12,7 +13,23 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-engine = create_async_engine(settings.database_url, echo=False)
+engine = create_async_engine(
+    settings.database_url,
+    echo=False,
+    pool_size=20,       # 기본 5 → 동시성 늘릴 때를 대비해 상향
+    max_overflow=20,    # 기본 10 → 합쳐서 최대 40개 동시 커넥션
+    pool_timeout=30,
+    connect_args={
+        # Supabase Supavisor 트랜잭션 모드(포트 6543) 사용 시 필수.
+        # 트랜잭션 모드는 커넥션을 요청마다 재배정하므로
+        # prepared statement를 세션 간에 재사용할 수 없음.
+        "statement_cache_size": 0,
+        "prepared_statement_cache_size": 0,
+        # 동시 burst 시 asyncpg 내부 카운터 기반 이름 충돌
+        # (DuplicatePreparedStatementError) 방지: 매 statement마다 uuid로 고유 이름 부여.
+        "prepared_statement_name_func": lambda: f"__asyncpg_{uuid.uuid4()}__",
+    },
+)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

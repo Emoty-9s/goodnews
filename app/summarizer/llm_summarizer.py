@@ -13,8 +13,8 @@ settings = get_settings()
 client = genai.Client(api_key=settings.gemini_api_key)
 
 # Gemini 503(UNAVAILABLE) 일시적 과부하 재시도 설정
-MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds
+MAX_RETRIES = 5
+RETRY_DELAY_BASE = 5  # seconds, exponential backoff 기준값
 
 
 # 모델별 기본 generation 설정
@@ -76,11 +76,12 @@ def _generate_content(
             return (response.text or "").strip()
         except Exception as e:
             if "503" in str(e) and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY_BASE * (2 ** attempt)  # 5, 10, 20, 40초
                 logger.warning(
-                    f"[{ticker}] Gemini 503 — {RETRY_DELAY}초 후 재시도 "
+                    f"[{ticker}] Gemini 503 — {delay}초 후 재시도 "
                     f"({attempt + 1}/{MAX_RETRIES})"
                 )
-                time.sleep(RETRY_DELAY)
+                time.sleep(delay)
                 continue
             logger.warning(f"[{ticker}] Gemini 호출 실패: {e}")
             return None
@@ -129,11 +130,12 @@ def _generate_structured(
                 return None
         except Exception as e:
             if "503" in str(e) and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY_BASE * (2 ** attempt)  # 5, 10, 20, 40초
                 logger.warning(
-                    f"[{ticker}] Gemini 503 — {RETRY_DELAY}초 후 재시도 "
+                    f"[{ticker}] Gemini 503 — {delay}초 후 재시도 "
                     f"({attempt + 1}/{MAX_RETRIES})"
                 )
-                time.sleep(RETRY_DELAY)
+                time.sleep(delay)
                 continue
             logger.warning(f"[{ticker}] Gemini 호출 실패: {e}")
             return None
@@ -154,6 +156,64 @@ def parse_sentiment(summary_text: str) -> str:
     if match:
         return SENTIMENT_MAP.get(match.group(1), "neutral")
     return "neutral"
+
+
+MAX_INPUT_CHARS = 20000  # 위클리 입력(daily_reports 또는 raw_articles)의
+                         # 누적 글자수 상한. flash-lite 출력 하드캡
+                         # (~8192 토큰, ~32000자) 대비 안전 마진을 둔 값.
+
+
+def _trim_to_char_budget(
+    items: list[dict],
+    date_key_candidates: list[str],
+    text_key_candidates: list[str],
+    max_chars: int = MAX_INPUT_CHARS,
+) -> list[dict]:
+    """items를 날짜 기준 최신순으로 정렬한 뒤, 누적 글자수가 max_chars를
+    넘기기 전까지만 포함시킨다.
+
+    건수가 아니라 글자수 기준이므로 기사가 길면 자동으로 적은 건수만,
+    짧으면 더 많은 건수가 포함된다. 개별 항목 내부는 자르지 않는다.
+    단, 첫 항목 하나는 max_chars를 초과해도 반드시 포함(빈 입력 방지).
+    반환 순서는 오래된 것 → 최신(기존 포매터가 기대하는 방향).
+    """
+    def _date_key(item: dict) -> str:
+        for key in date_key_candidates:
+            val = item.get(key)
+            if val:
+                return str(val)
+        return ""
+
+    def _text_len(item: dict) -> int:
+        total = 0
+        for key in text_key_candidates:
+            val = item.get(key)
+            if val:
+                total += len(str(val))
+        return total
+
+    if not items:
+        return items
+
+    sorted_desc = sorted(items, key=_date_key, reverse=True)
+    kept: list[dict] = []
+    total_chars = 0
+
+    for item in sorted_desc:
+        item_len = _text_len(item)
+        if kept and total_chars + item_len > max_chars:
+            break
+        kept.append(item)
+        total_chars += item_len
+
+    if len(kept) < len(items):
+        logger.info(
+            f"[입력 상한] {len(items)}건 → {len(kept)}건만 사용 "
+            f"(누적 {total_chars}자, 상한 {max_chars}자)"
+        )
+
+    kept_ids = {id(x) for x in kept}
+    return [x for x in sorted(items, key=_date_key) if id(x) in kept_ids]
 
 
 # ──────────────────────────────────────────
@@ -549,6 +609,13 @@ def render_weekly_report(data: WeeklyReportData) -> str:
 
 
 _WEEKLY_SCHEMA_RULES = """
+- weekly_flow: 최대 3문장으로 작성하세요. 핵심만 압축해서 쓰고,
+  문장을 늘려 늘어놓지 마세요.
+- positives/negatives 작성 시: 표현이나 출처만 다를 뿐 사실상 같은
+  소식(같은 사건, 같은 발표, 같은 수치를 다르게 서술한 경우)이면
+  여러 항목으로 나누지 말고 하나의 항목으로 합쳐서 작성하세요.
+  (예: "A사 실적 호조 발표"와 "A사 4분기 매출 예상치 상회"가 같은
+  실적 발표를 가리키면 하나로 통합)
 - positives/negatives: 각 항목은 {{"content": "...", "category": "..."}} 형태.
   category는 다음 5개 중 정확히 하나여야 합니다: 실적_재무, 사업_운영, 시장평가, 경영_인사, 거시_섹터
   - 실적_재무: 어닝 비트/미스, 매출 증가/감소, 가이던스 상향/하향, 마진 변화
@@ -592,6 +659,10 @@ PROMPT_WEEKLY_FROM_DAILIES = ("""
 ───────────────────────────────
 작성 규칙 (반드시 준수)
 ───────────────────────────────
+- [언어] 입력된 뉴스나 리포트가 영어로 되어 있어도, 인용하는 모든 문장과
+  숫자 설명은 반드시 한국어로 번역해서 작성하세요. 영어 원문을 그대로
+  복사하거나 영어 단어를 섞어 쓰지 마세요. (인물명, 회사명, 티커 등
+  고유명사는 예외)
 - 모든 내용은 위에 제공된 일간 리포트에 근거해야 합니다.
 - 수치(금액, %, 날짜)는 리포트에 명시된 것만 사용하세요.
 - 추측이나 일반적 상식으로 내용을 채우지 마세요.
@@ -620,6 +691,10 @@ PROMPT_WEEKLY_FROM_ARTICLES = ("""
 ───────────────────────────────
 작성 규칙 (반드시 준수)
 ───────────────────────────────
+- [언어] 입력된 뉴스나 리포트가 영어로 되어 있어도, 인용하는 모든 문장과
+  숫자 설명은 반드시 한국어로 번역해서 작성하세요. 영어 원문을 그대로
+  복사하거나 영어 단어를 섞어 쓰지 마세요. (인물명, 회사명, 티커 등
+  고유명사는 예외)
 - 모든 내용은 위에 제공된 뉴스에 근거해야 합니다.
 - 수치(금액, %, 날짜)는 뉴스에 명시된 것만 사용하세요.
 - 추측이나 일반적 상식으로 내용을 채우지 마세요.
@@ -648,6 +723,10 @@ PROMPT_WEEKLY_UPDATE = ("""
 ───────────────────────────────
 작성 규칙 (반드시 준수)
 ───────────────────────────────
+- [언어] 입력된 뉴스나 리포트가 영어로 되어 있어도, 인용하는 모든 문장과
+  숫자 설명은 반드시 한국어로 번역해서 작성하세요. 영어 원문을 그대로
+  복사하거나 영어 단어를 섞어 쓰지 마세요. (인물명, 회사명, 티커 등
+  고유명사는 예외)
 - 초안의 내용을 기반으로 이번 주 일간 리포트를 통합하세요.
 - 초안과 일간 리포트에 같은 이슈가 있으면 가장 최신/구체적인 것만 사용하세요.
 - 모든 수치(금액, %, 날짜)는 제공된 리포트에 명시된 것만 사용하세요.
@@ -713,9 +792,13 @@ def summarize_ticker(ticker: str, news_list: list[dict], digest_type: str) -> di
             return None
         sentiment = parse_sentiment(summary_text)
     else:
-        prompt = PROMPT_FULL.format(ticker=ticker, news_input=news_input)
+        news_list = _trim_to_char_budget(
+            news_list, ["publishedDate"], ["title", "text"],
+        )
+        prompt = PROMPT_FULL.format(ticker=ticker, news_input=build_news_input(news_list))
         data = _generate_structured(
             prompt, FullReportData, ticker, model=settings.gemini_model_lite,
+            max_output_tokens=16000,
         )
         if data is None:
             return None
@@ -818,6 +901,7 @@ def summarize_update(ticker: str, existing_report, new_articles: list[dict]) -> 
         prompt = PROMPT_FULL.format(ticker=ticker, news_input=news_input)
         data = _generate_structured(
             prompt, FullReportData, ticker, model=settings.gemini_model_lite,
+            max_output_tokens=16000,
         )
         if data is None:
             return None
@@ -914,6 +998,13 @@ def summarize_weekly(
     daily_reports = daily_reports or []
     raw_articles = raw_articles or []
 
+    daily_reports = _trim_to_char_budget(
+        daily_reports, ["report_date", "date"], ["summary_text", "summary"],
+    )
+    raw_articles = _trim_to_char_budget(
+        raw_articles, ["publishedDate"], ["title", "text"],
+    )
+
     if len(daily_reports) >= 3:
         deduped = _dedup_daily_bullets(_format_daily_reports(daily_reports))
         prompt = PROMPT_WEEKLY_FROM_DAILIES.format(
@@ -944,7 +1035,7 @@ def summarize_weekly(
     data = _generate_structured(
         prompt, WeeklyReportData, ticker,
         model=settings.gemini_model_lite,
-        max_output_tokens=3000,
+        max_output_tokens=16000,
     )
     if data is None:
         return None
@@ -975,6 +1066,9 @@ def summarize_weekly_update(
     if not draft_report and not daily_reports:
         return None
 
+    daily_reports = _trim_to_char_budget(
+        daily_reports, ["report_date", "date"], ["summary_text", "summary"],
+    )
     deduped_daily = _dedup_daily_bullets(_format_daily_reports(daily_reports))
     prompt = PROMPT_WEEKLY_UPDATE.format(
         ticker=ticker,
@@ -989,7 +1083,7 @@ def summarize_weekly_update(
     data = _generate_structured(
         prompt, WeeklyReportData, ticker,
         model=settings.gemini_model_lite,
-        max_output_tokens=3000,
+        max_output_tokens=16000,
     )
     if data is None:
         return None
@@ -1144,6 +1238,10 @@ def render_midterm_report(
 
 
 _MIDTERM_SCHEMA_RULES = """
+- trend_items 작성 시: 여러 주차에 걸쳐 표현만 다르게 반복되는 사실상
+  같은 소식(같은 사건, 같은 이슈가 다른 주차 리포트에서 약간 다르게
+  서술된 경우)이 있으면, 가장 대표적이거나 최신인 것 하나로 통합해서
+  작성하세요. 비슷한 내용을 여러 항목으로 나열하지 마세요.
 - trend_items: 각 항목은 {{"content": "...", "category": "..."}} 형태.
   category는 다음 5개 중 정확히 하나여야 합니다: 실적_재무, 사업_운영, 시장평가, 경영_인사, 거시_섹터
   - 실적_재무: 어닝, 매출, 가이던스, 마진 변화
@@ -1196,11 +1294,16 @@ S&P500 누적 수익률: {sp500_cumulative}%
 ───────────────────────────────
 작성 규칙 (반드시 준수)
 ───────────────────────────────
+- [언어] 입력된 뉴스나 리포트가 영어로 되어 있어도, 인용하는 모든 문장과
+  숫자 설명은 반드시 한국어로 번역해서 작성하세요. 영어 원문을 그대로
+  복사하거나 영어 단어를 섞어 쓰지 마세요. (인물명, 회사명, 티커 등
+  고유명사는 예외)
 - 모든 내용은 제공된 주간 리포트/섹터 뉴스에 근거해야 합니다. 추측 금지.
 - 사전 계산된 수치는 해석(benchmark_interpretation)에서만 참고하고,
   JSON 출력 필드에 %/%p 숫자를 직접 적지 마세요.
 - "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현 금지.
 - flow_narrative: 주차별 스토리를 변곡점 중심으로 서술. 단순 나열 금지.
+  최대 4~5문장으로 압축하세요.
   (예: "1~3주차 실적 기대감 → 4주차 발표 후 반전 → 5~6주차 안정")
 """ + _MIDTERM_SCHEMA_RULES + """
 ---
@@ -1324,7 +1427,10 @@ def summarize_midterm(
 
     logger.info(f"[{ticker}] midterm 요약 시작 ({week_count}주 기반)")
 
-    data = _generate_structured(prompt, MidtermReportData, ticker)
+    data = _generate_structured(
+        prompt, MidtermReportData, ticker,
+        max_output_tokens=16000,
+    )
     if data is None:
         return None
 
