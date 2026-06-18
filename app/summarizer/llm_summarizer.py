@@ -158,9 +158,11 @@ def parse_sentiment(summary_text: str) -> str:
     return "neutral"
 
 
-MAX_INPUT_CHARS = 20000  # 위클리 입력(daily_reports 또는 raw_articles)의
+MAX_INPUT_CHARS = 12000  # 위클리 입력(daily_reports 또는 raw_articles)의
                          # 누적 글자수 상한. flash-lite 출력 하드캡
                          # (~8192 토큰, ~32000자) 대비 안전 마진을 둔 값.
+                         # 실험적으로 output/input ≈ 1.56× 확인 →
+                         # 12000 × 1.56 ≈ 18700자 ≈ 4675 토큰으로 안전.
 
 
 def _trim_to_char_budget(
