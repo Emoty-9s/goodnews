@@ -1,8 +1,16 @@
-from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+from pydantic import Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=False,
+        extra="ignore",  # Railway 등이 주입하는 미정의 env var 무시
+    )
+
     # FMP API
     fmp_api_key: str
     fmp_base_url: str = "https://financialmodelingprep.com/api/v3"
@@ -33,7 +41,7 @@ class Settings(BaseSettings):
     llm_max_tokens_map: int = 800
     llm_max_tokens_reduce: int = 1500
 
-    # API 서버
+    # API 서버 — Railway는 PORT 환경변수로 포트를 주입하므로 fallback으로 읽음
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
@@ -42,9 +50,17 @@ class Settings(BaseSettings):
     universe_min_market_cap: float = 100_000_000.0  # USD 1억
     universe_exchanges: str = "NASDAQ,NYSE,AMEX"
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    @model_validator(mode="before")
+    @classmethod
+    def _railway_port_fallback(cls, data: dict) -> dict:
+        # pydantic-settings v2는 field name 기반(API_PORT)으로만 env 조회하므로
+        # Railway가 주입하는 PORT 변수를 validator에서 직접 읽어 api_port에 주입
+        import os
+        if isinstance(data, dict) and not os.environ.get("API_PORT"):
+            port = os.environ.get("PORT")
+            if port:
+                data["api_port"] = int(port)
+        return data
 
 
 @lru_cache()

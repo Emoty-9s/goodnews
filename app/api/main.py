@@ -7,8 +7,11 @@ GoodNews AI - FastAPI 서버
   GET /health
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from typing import Optional
@@ -20,10 +23,26 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # production에서는 마이그레이션으로 스키마를 관리하므로 자동 생성 생략
+    if settings.app_env == "production":
+        logger.info("[startup] production 환경 — create_tables() 스킵 (마이그레이션 관리)")
+    else:
+        try:
+            await create_tables()
+            logger.info("[startup] create_tables() 완료")
+        except Exception as e:
+            logger.warning(f"[startup] create_tables() 실패 (서버 계속 기동): {e}")
+    yield
+
+
 app = FastAPI(
     title="GoodNews AI",
     description="미국 주식 뉴스 AI 요약 서비스",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -32,11 +51,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-async def startup():
-    await create_tables()
 
 
 # ──────────────────────────────────────────
@@ -71,8 +85,8 @@ async def get_summary(
     ticker: str,
     digest_type: str = Query(
         default="daily",
-        pattern="^(daily|weekly|monthly|yearly)$",
-        description="요약 주기: daily | weekly | monthly | yearly"
+        pattern="^(daily|weekly|midterm)$",
+        description="요약 주기: daily | weekly | midterm"
     ),
     db: AsyncSession = Depends(get_db),
 ):
@@ -105,7 +119,7 @@ async def get_feed(
     ),
     digest_type: str = Query(
         default="daily",
-        pattern="^(daily|weekly|monthly|yearly)$"
+        pattern="^(daily|weekly|midterm)$"
     ),
     db: AsyncSession = Depends(get_db),
 ):
@@ -135,7 +149,7 @@ async def get_all_digests(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    단일 종목의 모든 주기(daily/weekly/monthly/yearly) 요약 한번에 조회.
+    단일 종목의 모든 주기(daily/weekly/midterm) 요약 한번에 조회.
     """
     ticker = ticker.upper()
     result = await db.execute(
