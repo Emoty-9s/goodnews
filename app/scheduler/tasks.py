@@ -9,6 +9,7 @@ Celery 배치 스케줄러
 
 import asyncio
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from celery import Celery
@@ -59,6 +60,17 @@ from app.models.database import (
 )
 
 ET = ZoneInfo("America/New_York")
+
+# ── 파일 로그 설정 (로컬에 logger.add()가 없으면 여기서 초기화) ──
+_LOG_DIR = Path(__file__).parent.parent.parent / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+logger.add(
+    str(_LOG_DIR / "tasks_{time:YYYY-MM-DD}.log"),
+    level="INFO",
+    encoding="utf-8",
+    rotation="1 day",
+    retention="30 days",
+)
 
 def _week_monday(d: date) -> date:
     """주어진 날짜가 속한 주의 월요일."""
@@ -262,6 +274,7 @@ async def run_daily_closing(test_tickers: list[str] | None = None):
             result = summarize_ticker(ticker, articles, "daily")
             if result is None:
                 fail += 1
+                logger.warning(f"[FAIL][daily_closing][{ticker}][{today_et}] LLM 반환 None")
                 if _check_abort("daily_closing", success, fail, total, ticker):
                     return
                 continue
@@ -337,6 +350,7 @@ async def run_daily_premarket(
             )
             if summary is None:
                 fail += 1
+                logger.warning(f"[FAIL][daily_premarket][{ticker}][{yesterday_et}] LLM 반환 None")
                 if _check_abort("daily_premarket", success, fail, total, ticker):
                     return
                 continue
@@ -408,6 +422,10 @@ async def run_weekly_draft(test_tickers: list[str] | None = None):
             summary = summarize_weekly(ticker, daily_reports=dailies, raw_articles=raw)
             if summary is None:
                 fail += 1
+                logger.warning(
+                    f"[FAIL][weekly_draft][{ticker}][{week_monday}] "
+                    f"LLM 반환 None (daily {len(dailies)}건 / articles {len(raw)}건)"
+                )
                 if _check_abort("weekly_draft", success, fail, total, ticker):
                     return
                 continue
@@ -500,6 +518,14 @@ async def run_weekly_final(test_tickers: list[str] | None = None):
 
             if summary is None:
                 fail += 1
+                path_used = (
+                    "draft_update" if draft else
+                    "daily" if this_week_dailies else "raw"
+                )
+                logger.warning(
+                    f"[FAIL][weekly_final][{ticker}][{week_monday}] "
+                    f"LLM 반환 None (경로: {path_used})"
+                )
                 if _check_abort("weekly_final", success, fail, total, ticker):
                     return
                 continue
@@ -660,6 +686,10 @@ async def run_midterm(
                 sector_news=sector_news,
             )
             if result is None:
+                logger.warning(
+                    f"[FAIL][midterm][{ticker}][{week_monday}] "
+                    f"LLM 반환 None ({len(weekly_reports)}주 기반)"
+                )
                 stats["skip"] += 1
                 continue
 

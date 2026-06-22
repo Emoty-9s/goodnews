@@ -149,6 +149,14 @@ class DryRunContext:
         self._weekly_finals: dict[tuple[str, date], dict] = {}
         # midterm을 생성한 (ticker, week_monday) 기록 (get_last_midterm_date 대체용)
         self._midterm_dates: dict[str, list[date]] = {}
+        # dry-run 내에서 생성한 weekly draft를 메모리에도 보관
+        # key: (ticker, week_monday) → dict
+        self._weekly_drafts: dict[tuple[str, date], dict] = {}
+        # dry-run 내에서 생성한 daily closing을 메모리에도 보관
+        # (운영 DB에는 안 쓰지만, weekly가 같은 시뮬레이션 내 데이터를
+        #  참조할 수 있게 하기 위함).
+        # key: (ticker, report_date) → dict
+        self._daily_reports: dict[tuple[str, date], dict] = {}
 
     # ── LLM 사용량 기록 ──
 
@@ -195,6 +203,15 @@ class DryRunContext:
             "sentiment": sentiment,
             "source_urls": source_urls,
         })
+        # weekly가 참조할 수 있도록 메모리에도 보관
+        self._daily_reports[(ticker, report_date)] = {
+            "ticker": ticker,
+            "report_date": report_date,  # date 객체로 저장 (str 아님)
+            "version": version,
+            "summary_text": summary_text,
+            "sentiment": sentiment,
+            "source_urls": source_urls,
+        }
 
     def save_weekly(
         self,
@@ -217,6 +234,8 @@ class DryRunContext:
             data["price_change_pct"] = price_change_pct
         self._write(path, data)
         # midterm이 같은 시뮬레이션 내에서 참조할 수 있도록 final만 메모리에도 보관
+        if version == "draft":
+            self._weekly_drafts[(ticker, week_monday)] = data
         if version == "final":
             self._weekly_finals[(ticker, week_monday)] = data
 
@@ -237,6 +256,35 @@ class DryRunContext:
             "price_change_pct": price_change_pct,
         })
         self._midterm_dates.setdefault(ticker, []).append(week_monday)
+
+    def get_weekly_draft_local(
+        self, ticker: str, week_monday: date
+    ) -> dict | None:
+        """dry-run 메모리에서 해당 (ticker, week_monday)의 weekly draft를 반환.
+        운영 DB 함수 get_weekly_draft()의 dry-run 버전."""
+        return self._weekly_drafts.get((ticker, week_monday))
+
+    def get_daily_reports_local(
+        self,
+        ticker: str,
+        since: date,
+        until: date,
+    ) -> list[dict]:
+        """dry-run 메모리에서 해당 ticker의 daily 리포트를 반환.
+        운영 DB 함수 get_daily_reports()의 dry-run 버전.
+
+        DB 함수와 동일한 조건:
+          - 날짜 범위: since <= report_date <= until
+          - 정렬: report_date ASC (오래된 것부터)
+          - closing 버전만 반환 (version == "closing")
+        """
+        items = [
+            v for (t, rd), v in self._daily_reports.items()
+            if t == ticker and since <= rd <= until
+            and v.get("version") == "closing"
+        ]
+        items.sort(key=lambda r: r["report_date"])
+        return items
 
     def has_weekly_final_local(self, ticker: str, week_monday: date) -> bool:
         """dry-run 메모리에 해당 (ticker, week_monday) final이 있는지 확인.
@@ -386,6 +434,7 @@ async def sim_daily_closing(
         ctx.active_digest_type = "daily"
     result = await asyncio.to_thread(summarize_ticker, ticker, articles, "daily")
     if result is None:
+        logger.warning(f"[FAIL][daily][{ticker}][{day}] LLM 반환 None")
         return "fail"
 
     if ctx:
@@ -414,7 +463,11 @@ async def sim_weekly_draft(
 ) -> str:
     since_date = week_monday - timedelta(days=7)
     until_date = week_monday
-    dailies = await get_daily_reports(ticker, since_date, until_date)
+
+    if ctx:
+        dailies = ctx.get_daily_reports_local(ticker, since_date, until_date)
+    else:
+        dailies = await get_daily_reports(ticker, since_date, until_date)
 
     raw = []
     if len(dailies) < 3:
@@ -431,6 +484,10 @@ async def sim_weekly_draft(
         summarize_weekly, ticker, daily_reports=dailies, raw_articles=raw
     )
     if summary is None:
+        logger.warning(
+            f"[FAIL][weekly_draft][{ticker}][{week_monday}] "
+            f"LLM 반환 None (daily {len(dailies)}건 / articles {len(raw)}건)"
+        )
         return "fail"
 
     if ctx:
@@ -460,8 +517,14 @@ async def sim_weekly_final(
     since_dt = _et_midnight(week_monday)
     until_dt = _et_midnight(week_friday + timedelta(days=1))
 
-    draft = await get_weekly_draft(ticker, week_monday)
-    this_week_dailies = await get_daily_reports(ticker, week_monday, week_friday)
+    if ctx:
+        draft = ctx.get_weekly_draft_local(ticker, week_monday)
+        this_week_dailies = ctx.get_daily_reports_local(
+            ticker, week_monday, week_friday
+        )
+    else:
+        draft = await get_weekly_draft(ticker, week_monday)
+        this_week_dailies = await get_daily_reports(ticker, week_monday, week_friday)
 
     if ctx:
         ctx.active_digest_type = "weekly_final"
@@ -484,6 +547,14 @@ async def sim_weekly_final(
         summary = await asyncio.to_thread(summarize_weekly, ticker, raw_articles=raw)
 
     if summary is None:
+        path_used = (
+            "draft_update" if draft else
+            "daily" if this_week_dailies else "raw"
+        )
+        logger.warning(
+            f"[FAIL][weekly_final][{ticker}][{week_monday}] "
+            f"LLM 반환 None (경로: {path_used})"
+        )
         return "fail"
 
     pct = price_changes.get(ticker)
@@ -617,6 +688,10 @@ async def sim_midterm(
         sector_news=sector_news,
     )
     if result is None:
+        logger.warning(
+            f"[FAIL][midterm][{ticker}][{week_monday}] "
+            f"LLM 반환 None ({len(weekly_reports)}주 기반)"
+        )
         return "skip"
 
     if dry_run and ctx:
@@ -830,6 +905,13 @@ def main():
         ctx = DryRunContext(out_dir, tickers, start, end)
         _install_llm_hook(ctx)
         logger.info(f"[DRY-RUN] 활성화 — 운영 DB 쓰기 차단, 출력: {out_dir}")
+    else:
+        out_dir = ROOT / "sim_results" / f"sim_{start}_{end}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = out_dir / "run.log"
+    logger.add(str(log_path), level="DEBUG", encoding="utf-8", rotation=None, mode="w")
+    logger.info(f"로그 파일: {log_path}")
 
     asyncio.run(
         run(
