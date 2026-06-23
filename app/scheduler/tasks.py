@@ -3,7 +3,7 @@ Celery 배치 스케줄러
 ====================
 모든 스케줄 기준: 미국 동부시간 (America/New_York)
 
-- daily  : closing(21:00) / premarket(08:00)
+- daily  : closing(21:00) / overnight(08:00)
 - weekly : draft(월 08:00) / final(금 21:00) / sector-news(금 21:30)
 """
 
@@ -37,7 +37,10 @@ from app.summarizer.llm_summarizer import (
     summarize_weekly_update,
 )
 from app.models.database import (
+    delete_closing_for_overnight,
+    delete_draft_for_final,
     delete_old_daily_reports,
+    delete_old_news_articles,
     delete_old_weekly_data,
     get_articles_for_ticker_between,
     get_closing_report,
@@ -253,6 +256,13 @@ async def run_daily_closing(test_tickers: list[str] | None = None):
         deleted = await delete_old_daily_reports()
         logger.info(f"[DAILY-CLOSING] 오래된 daily 리포트 {deleted}건 삭제")
 
+        deleted_articles = await delete_old_news_articles(days=7)
+        logger.info(
+            f"[DAILY-CLOSING] 오래된 원문 삭제 — "
+            f"articles={deleted_articles['articles']}건, "
+            f"market_news={deleted_articles['market_news_articles']}건"
+        )
+
         since = et_now - timedelta(hours=24)
         tickers = test_tickers if test_tickers else load_all_tickers()
         collector = FMPNewsCollector()
@@ -359,11 +369,13 @@ async def run_daily_premarket(
                 ticker=ticker,
                 digest_type="daily",
                 report_date=yesterday_et,
-                version="premarket",
+                version="overnight",
                 summary_text=summary["summary_text"],
                 sentiment=summary["sentiment"],
                 source_urls=summary["source_urls"],
             )
+            # overnight은 closing의 최종본 → 같은 날짜 closing 삭제
+            await delete_closing_for_overnight(ticker, yesterday_et)
             success += 1
 
         _alert_summary("daily_premarket", success, fail, total)
@@ -540,6 +552,8 @@ async def run_weekly_final(test_tickers: list[str] | None = None):
                 source_urls=[],
                 price_change_pct=price_changes.get(ticker),
             )
+            # final은 draft의 최종본 → 같은 주 draft 삭제
+            await delete_draft_for_final(ticker, week_monday)
             success += 1
 
         _alert_summary("weekly_final", success, fail, total)

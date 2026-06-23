@@ -2,8 +2,8 @@
 GoodNews AI - FastAPI 서버
 ============================
 엔드포인트:
-  GET /summary/{ticker}?digest_type=daily
-  GET /feed?tickers=AAPL,NVDA,MSFT&digest_type=daily
+  GET /summary/{ticker}?digest_type=daily|weekly|midterm
+  GET /feed?tickers=AAPL,NVDA,MSFT&digest_type=daily|weekly|midterm
   GET /health
 """
 

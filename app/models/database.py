@@ -726,7 +726,7 @@ async def get_sector_news_series(sector: str, week_mondays: list[date]) -> list[
 
 async def delete_old_weekly_data() -> dict:
     """52주(364일) 초과된 주간 데이터 삭제. 테이블별 삭제 건수 반환."""
-    cutoff = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(weeks=52)
+    cutoff = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(weeks=12)
 
     async with AsyncSessionLocal() as session:
         r1 = await session.execute(
@@ -766,6 +766,70 @@ async def delete_old_daily_reports() -> int:
         )
         await session.commit()
     return result.rowcount or 0
+
+
+async def delete_old_news_articles(days: int = 7) -> dict:
+    """
+    articles / market_news_articles 에서 days일 초과된 원문 삭제.
+    - articles: daily/overnight 생성에만 쓰이므로 7일이면 충분
+    - market_news_articles: 수집 당일 sector_news_summaries 생성 후 불필요
+    반환: {"articles": int, "market_news_articles": int}
+    """
+    cutoff = datetime.now(ZoneInfo("America/New_York")) - timedelta(days=days)
+
+    async with AsyncSessionLocal() as session:
+        r1 = await session.execute(
+            text("DELETE FROM articles WHERE published_at < :cutoff"),
+            {"cutoff": cutoff},
+        )
+        r2 = await session.execute(
+            text("DELETE FROM market_news_articles WHERE published_at < :cutoff"),
+            {"cutoff": cutoff},
+        )
+        await session.commit()
+
+    return {
+        "articles": r1.rowcount or 0,
+        "market_news_articles": r2.rowcount or 0,
+    }
+
+
+async def delete_closing_for_overnight(ticker: str, report_date: date) -> None:
+    """
+    overnight 리포트 생성 완료 후 같은 날짜의 closing 삭제.
+    overnight은 closing의 최종 업그레이드본이므로 closing은 불필요.
+    """
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            text(
+                "DELETE FROM news_summaries "
+                "WHERE ticker = :ticker "
+                "  AND digest_type = 'daily' "
+                "  AND report_date = :report_date "
+                "  AND version = 'closing'"
+            ),
+            {"ticker": ticker.upper(), "report_date": report_date},
+        )
+        await session.commit()
+
+
+async def delete_draft_for_final(ticker: str, week_monday: date) -> None:
+    """
+    weekly final 생성 완료 후 같은 주의 draft 삭제.
+    final은 draft의 최종 업그레이드본이므로 draft는 불필요.
+    """
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            text(
+                "DELETE FROM news_summaries "
+                "WHERE ticker = :ticker "
+                "  AND digest_type = 'weekly' "
+                "  AND report_date = :week_monday "
+                "  AND version = 'draft'"
+            ),
+            {"ticker": ticker.upper(), "week_monday": week_monday},
+        )
+        await session.commit()
 
 
 # ──────────────────────────────────────────
@@ -827,13 +891,22 @@ async def upsert_midterm(
     price_change_pct: float | None,
 ) -> None:
     """
-    news_summaries 에 digest_type='midterm', version='final' 로 Upsert.
-    충돌 키: (ticker, digest_type, report_date).
+    news_summaries 에 digest_type='midterm', version='final' 로 저장.
+    INSERT 전에 해당 ticker의 기존 미드텀을 모두 삭제하므로
+    항상 ticker당 미드텀 1개만 유지된다.
     sentiment / price_change_pct 는 nullable.
     """
     import json as _json
 
     async with AsyncSessionLocal() as session:
+        # 기존 미드텀 전부 삭제 → 최신 1개만 유지
+        await session.execute(
+            text(
+                "DELETE FROM news_summaries "
+                "WHERE ticker = :ticker AND digest_type = 'midterm'"
+            ),
+            {"ticker": ticker.upper()},
+        )
         await session.execute(
             text(
                 """
@@ -845,12 +918,6 @@ async def upsert_midterm(
                     (:ticker, 'midterm', :report_date, 'final',
                      :summary_text, :sentiment, CAST(:source_urls AS JSONB),
                      :price_change_pct, NOW())
-                ON CONFLICT (ticker, digest_type, report_date)
-                DO UPDATE SET
-                    summary_text     = EXCLUDED.summary_text,
-                    sentiment        = EXCLUDED.sentiment,
-                    price_change_pct = EXCLUDED.price_change_pct,
-                    updated_at       = NOW()
                 """
             ),
             {
