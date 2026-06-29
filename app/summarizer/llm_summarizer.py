@@ -13,8 +13,8 @@ settings = get_settings()
 client = genai.Client(api_key=settings.gemini_api_key)
 
 # Gemini 503(UNAVAILABLE) 일시적 과부하 재시도 설정
-MAX_RETRIES = 5
-RETRY_DELAY_BASE = 5  # seconds, exponential backoff 기준값
+MAX_RETRIES = 3
+RETRY_DELAY_503 = 5  # seconds, 503 고정 대기 (backoff 없음)
 
 
 # 모델별 기본 generation 설정
@@ -76,12 +76,11 @@ def _generate_content(
             return (response.text or "").strip()
         except Exception as e:
             if "503" in str(e) and attempt < MAX_RETRIES - 1:
-                delay = RETRY_DELAY_BASE * (2 ** attempt)  # 5, 10, 20, 40초
                 logger.warning(
-                    f"[{ticker}] Gemini 503 — {delay}초 후 재시도 "
+                    f"[{ticker}] Gemini 503 — {RETRY_DELAY_503}초 후 재시도 "
                     f"({attempt + 1}/{MAX_RETRIES})"
                 )
-                time.sleep(delay)
+                time.sleep(RETRY_DELAY_503)
                 continue
             logger.warning(f"[{ticker}] Gemini 호출 실패: {e}")
             return None
@@ -130,19 +129,18 @@ def _generate_structured(
                 return None
         except Exception as e:
             if "503" in str(e) and attempt < MAX_RETRIES - 1:
-                delay = RETRY_DELAY_BASE * (2 ** attempt)  # 5, 10, 20, 40초
                 logger.warning(
-                    f"[{ticker}] Gemini 503 — {delay}초 후 재시도 "
+                    f"[{ticker}] Gemini 503 — {RETRY_DELAY_503}초 후 재시도 "
                     f"({attempt + 1}/{MAX_RETRIES})"
                 )
-                time.sleep(delay)
+                time.sleep(RETRY_DELAY_503)
                 continue
             logger.warning(f"[{ticker}] Gemini 호출 실패: {e}")
             return None
 
 SENTIMENT_MAP = {
-    "호재 우세": "bullish",
-    "악재 우세": "bearish",
+    "호재 우세": "positive",
+    "악재 우세": "negative",
     "혼조": "mixed",
     "중립": "neutral",
 }
@@ -356,7 +354,7 @@ Rules:
   must be a single self-contained item, maximum 2 Korean sentences.
 - If positives/negatives/neutral_items have nothing to report, return an empty list,
   NOT a string like "없음".
-- sentiment must be exactly one of: bullish, bearish, mixed, neutral.
+- sentiment must be exactly one of: positive, negative, mixed, neutral.
 
 Respond with a single JSON object matching the required schema. No prose outside JSON.
 
@@ -399,15 +397,15 @@ class FullReportData(BaseModel):
     neutral_items: list[str] = []
     temperature_gap: str
     checkpoint_section: CheckpointSection | None = None
-    sentiment: str  # bullish / bearish / mixed / neutral
+    sentiment: str  # positive / negative / mixed / neutral
     sentiment_reason: str
     investor_view: InvestorView
     next_watch: list[str] = []
 
 
 _SENTIMENT_TO_LABEL = {
-    "bullish": "호재 우세",
-    "bearish": "악재 우세",
+    "positive": "호재 우세",
+    "negative": "악재 우세",
     "mixed": "혼조",
     "neutral": "중립",
 }
@@ -519,11 +517,11 @@ class WeeklyReportData(BaseModel):
     positives_interpretation: str | None = None
     negatives: list[CategorizedItem] = []
     negatives_interpretation: str | None = None
-    sentiment_start: str | None = None   # bullish/bearish/mixed/neutral, 주초
-    sentiment_end: str | None = None     # bullish/bearish/mixed/neutral, 주말
+    sentiment_start: str | None = None   # positive/negative/mixed/neutral, 주초
+    sentiment_end: str | None = None     # positive/negative/mixed/neutral, 주말
     temperature_reason: str | None = None
     next_watch: list[str] = []
-    sentiment: str            # 이번 주 종합 판단. bullish/bearish/mixed/neutral
+    sentiment: str            # 이번 주 종합 판단. positive/negative/mixed/neutral
     sentiment_reason: str
 
 
@@ -631,12 +629,12 @@ _WEEKLY_SCHEMA_RULES = """
   리스트가 비어있으면 null로 두세요.
 - sentiment_start/sentiment_end/temperature_reason: 주초→주말 sentiment 변화를
   판단할 근거가 부족하면 셋 다 null로 두세요. 판단 가능하면 셋 다 채우세요.
-  sentiment_start/sentiment_end는 bullish/bearish/mixed/neutral 중 하나.
+  sentiment_start/sentiment_end는 positive/negative/mixed/neutral 중 하나.
 - next_watch: 아래 두 조건을 모두 충족하는 항목만 포함하세요.
   ① 제공된 자료 본문에 명시적으로 언급된 내용
   ② 구체적인 날짜 또는 이벤트명이 있는 것
   조건 미충족 시 빈 리스트로 두세요.
-- sentiment(이번 주 종합 판단)는 bullish/bearish/mixed/neutral 중 정확히 하나.
+- sentiment(이번 주 종합 판단)는 positive/negative/mixed/neutral 중 정확히 하나.
 - "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현 금지.
 - Do not include citation numbers like ([1]), ([2]) in any field.
 - sentiment_reason은 "근거:" 같은 라벨 없이 자연스러운 문장으로 쓰세요.
@@ -768,7 +766,7 @@ def select_prompt(news_count: int) -> str:
 # 메인 요약 함수
 # ──────────────────────────────────────────
 
-_VALID_SENTIMENTS = {"bullish", "bearish", "mixed", "neutral"}
+_VALID_SENTIMENTS = {"positive", "negative", "mixed", "neutral"}
 
 
 def summarize_ticker(ticker: str, news_list: list[dict], digest_type: str) -> dict | None:
@@ -834,7 +832,7 @@ Rules:
 - For [주가 영향], use exactly one of these values:
   호재 우세 / 악재 우세 / 혼조 / 중립
   This value must match the sentiment field:
-  호재 우세 → bullish / 악재 우세 → bearish / 혼조 → mixed / 중립 → neutral
+  호재 우세 → positive / 악재 우세 → negative / 혼조 → mixed / 중립 → neutral
 
 Output format:
 
@@ -975,7 +973,7 @@ def _dedup_daily_bullets(reports_text: str, max_dupes: int = 2) -> str:
 # 주간 리포트 생성 (월요일 초안)
 # ──────────────────────────────────────────
 
-_VALID_WEEKLY_SENTIMENTS = {"bullish", "bearish", "mixed", "neutral"}
+_VALID_WEEKLY_SENTIMENTS = {"positive", "negative", "mixed", "neutral"}
 
 
 def summarize_weekly(
@@ -1172,38 +1170,31 @@ def parse_sector_sentiment(section: str) -> str:
 # Midterm 구조화 출력 스키마 + 고정 템플릿 렌더링
 # daily(FullReportData)/weekly(WeeklyReportData)와 동일한 방식.
 
-class MidtermReportData(BaseModel):
+# ── Part A: 뉴스 기반 스키마 ──────────────────────────────────
+class MidtermPartAData(BaseModel):
     headline: str
     flow_narrative: str
     trend_items: list[CategorizedItem] = []
     trend_interpretation: str | None = None
+
+
+# ── Part B: 수치/판단 기반 스키마 ────────────────────────────
+class MidtermPartBData(BaseModel):
     benchmark_interpretation: str
     sector_comparison: str | None = None
-    sentiment: str            # bullish/bearish/mixed/neutral
+    macro_analysis: str | None = None
+    sentiment: str            # positive/negative/mixed/neutral
     sentiment_reason: str
 
 
-def render_midterm_report(
-    data: MidtermReportData,
-    sector_name: str,
-    exchange: str,
-    stock_cumulative: float,
-    sp500_cumulative: float,
-    sector_cumulative: float,
-    alpha_vs_market: float,
-    alpha_vs_sector: float,
-) -> str:
-    """
-    MidtermReportData → 고정 템플릿 마크다운 텍스트.
-    [누적 성과 vs 벤치마크]의 숫자 줄은 LLM 출력이 아니라
-    이 함수가 직접 포맷팅한다.
-    """
+def render_midterm_part_a(data: MidtermPartAData) -> str:
+    """MidtermPartAData → 뉴스 기반 섹션 텍스트."""
     lines: list[str] = []
-    lines.append("[중장기 핵심 한 줄]")
+    lines.append("[중장기 핵심 뉴스 한 줄]")
     lines.append(data.headline.strip())
     lines.append("")
 
-    lines.append("[중장기 흐름]")
+    lines.append("[중장기 뉴스 흐름]")
     lines.append(data.flow_narrative.strip())
     lines.append("")
 
@@ -1217,6 +1208,24 @@ def render_midterm_report(
             lines.append(f"→ 해석: {data.trend_interpretation.strip()}")
         lines.append("")
 
+    return "\n".join(lines).strip()
+
+
+def render_midterm_part_b(
+    data: MidtermPartBData | None,
+    sector_name: str,
+    exchange: str,
+    stock_cumulative: float,
+    sp500_cumulative: float,
+    sector_cumulative: float,
+    alpha_vs_market: float,
+    alpha_vs_sector: float,
+) -> str:
+    """
+    MidtermPartBData → 수치/판단 섹션 텍스트.
+    [누적 성과 vs 벤치마크] 수치 줄은 코드가 직접 삽입.
+    """
+    lines: list[str] = []
     lines.append("[누적 성과 vs 벤치마크]")
     lines.append(f"이 종목 누적 수익률: {stock_cumulative:+.2f}%")
     lines.append(f"S&P500 누적 수익률: {sp500_cumulative:+.2f}%")
@@ -1224,64 +1233,92 @@ def render_midterm_report(
     lines.append(f"시장 대비 alpha: {alpha_vs_market:+.2f}%p")
     lines.append(f"섹터 대비 alpha: {alpha_vs_sector:+.2f}%p")
     lines.append("")
-    lines.append(data.benchmark_interpretation.strip())
-    lines.append("")
 
-    if data.sector_comparison:
-        lines.append("[종목 vs 섹터 흐름 비교]")
-        lines.append(data.sector_comparison.strip())
+    if data is not None:
+        lines.append(data.benchmark_interpretation.strip())
         lines.append("")
 
-    sentiment_label = _SENTIMENT_TO_LABEL.get(data.sentiment, "중립")
-    lines.append(f"[중장기 종합 판단] {sentiment_label}")
-    lines.append(data.sentiment_reason.strip())
+        if data.sector_comparison:
+            lines.append("[종목 vs 섹터 흐름 비교]")
+            lines.append(data.sector_comparison.strip())
+            lines.append("")
+
+        if data.macro_analysis:
+            lines.append("[거시환경 분석]")
+            lines.append(data.macro_analysis.strip())
+            lines.append("")
+
+        sentiment_label = _SENTIMENT_TO_LABEL.get(data.sentiment, "중립")
+        lines.append(f"[중장기 종합 판단] {sentiment_label}")
+        lines.append(data.sentiment_reason.strip())
 
     return "\n".join(lines)
 
 
-_MIDTERM_SCHEMA_RULES = """
-- trend_items 작성 시: 여러 주차에 걸쳐 표현만 다르게 반복되는 사실상
-  같은 소식(같은 사건, 같은 이슈가 다른 주차 리포트에서 약간 다르게
-  서술된 경우)이 있으면, 가장 대표적이거나 최신인 것 하나로 통합해서
-  작성하세요. 비슷한 내용을 여러 항목으로 나열하지 마세요.
-- trend_items: 각 항목은 {{"content": "...", "category": "..."}} 형태.
-  category는 다음 5개 중 정확히 하나여야 합니다: 실적_재무, 사업_운영, 시장평가, 경영_인사, 거시_섹터
-  - 실적_재무: 어닝, 매출, 가이던스, 마진 변화
-  - 사업_운영: 계약/파트너십, 신제품, FDA, 리콜, 생산 중단, 소송
-  - 시장평가: 목표주가, 투자의견, 커버리지
-  - 경영_인사: CEO/핵심 인력, 자사주 매입, 배당, 구조조정
-  - 거시_섹터: 규제, 정책, 업황, 관세, 조사
-- trend_items에 해당 내용이 없으면 빈 리스트를 반환하세요 (억지로 채우지 마세요).
-- trend_interpretation: trend_items가 비어있지 않을 때만 작성. 비어있으면 null.
-  반복/증가/감소한 이슈를 2~3문장으로 요약하세요.
-- benchmark_interpretation: 누적 성과에 대한 해석 문장만 작성하세요.
-  숫자(%, %p)는 이 필드에 직접 적지 마세요 — 최종 출력의 숫자 줄은 시스템이 자동 삽입합니다.
-  참고용 사전 계산값은 해석할 때만 활용하세요.
-- sector_comparison 작성 시 주의:
-  ① 주차/날짜를 하나씩 나열하면서 설명하지 마세요
-     (예: "1월 26일 주간에는 ~였으나 2월 9일 주간에는 ~" 같은 형식 금지).
-  ② "과거에는 ~했지만 최근에는 ~로 바뀌었다" 같은 시간 흐름 전개도 쓰지 마세요.
-  ③ 제공된 기간 전체를 한 덩어리로 보고, 지금 종목과 섹터가 어떤
-     관계인지(동조하고 있는지, 종목만 따로 움직이는지, 비교할 자료가
-     부족한지)를 짧은 문단으로 진단하듯 쓰세요.
-  ④ 섹터 뉴스가 있는 주차가 하나도 없으면 null로 두세요.
-- sentiment: bullish/bearish/mixed/neutral 중 정확히 하나.
-- sentiment_reason: alpha + sentiment 추세를 종합한 한 줄. "근거:" 라벨 없이 자연스러운 문장으로.
-- "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현 금지.
+_MIDTERM_PART_A_SCHEMA_RULES = """
+- headline: 전체 기간을 관통하는 핵심 한 줄 (티커명 + 주제). 50자 이내.
+- flow_narrative: 주요 변곡점 중심 서술. 단순 나열 금지. 최대 4~5문장으로 압축.
+  (예: "1~3주차 실적 기대감 → 4주차 발표 후 반전 → 5~6주차 안정")
+- trend_items: 여러 주에 걸쳐 반복/심화된 이슈 목록. 비슷한 이슈는 대표 1개로 통합.
+  각 항목은 {{"content": "...", "category": "..."}} 형태.
+  category는 다음 5개 중 정확히 하나:
+    실적_재무: 어닝, 매출, 가이던스, 마진 변화
+    사업_운영: 계약/파트너십, 신제품, FDA, 리콜, 생산 중단, 소송
+    시장평가: 목표주가, 투자의견, 커버리지
+    경영_인사: CEO/핵심 인력, 자사주 매입, 배당, 구조조정
+    거시_섹터: 규제, 정책, 업황, 관세, 조사
+  해당 내용이 없으면 빈 리스트 [] (억지로 채우지 마세요).
+- trend_interpretation: trend_items ≥ 1일 때만 작성. 없으면 null.
+  반복/증가/감소한 이슈를 2~3문장으로 요약.
+- "~로 알려졌다", "~할 것으로 보인다" 추측 표현 금지.
 - Do not include citation numbers like ([1]), ([2]) in any field.
 
 Respond with a single JSON object matching the required schema. No prose outside JSON.
 """
 
+_MIDTERM_PART_B_SCHEMA_RULES = """
+- benchmark_interpretation: 수치 성과 해석 문단 (2~3문장).
+  숫자(%/%p)를 이 필드에 직접 적지 마세요 — 시스템이 자동 삽입합니다.
+  사전 계산값은 해석할 때만 참고하세요.
+- sector_comparison: 종목과 섹터의 동조/이탈 관계를 한 문단으로 진단.
+  날짜/주차별 나열 금지. "과거에는 ~했지만 최근에는" 시간 흐름 전개 금지.
+  전체 기간을 한 덩어리로 보고 관계를 짧게 진단하세요.
+  섹터 비교 자료가 없으면 null.
+- macro_analysis: 섹터 뉴스 기반 거시환경 분석, 2~3문장. 섹터 뉴스 없으면 null.
+- sentiment: positive/negative/mixed/neutral 중 정확히 하나.
+- sentiment_reason: alpha + 뉴스 흐름 종합 한 줄. "근거:" 라벨 없이 자연스럽게.
+- 입력된 섹터 뉴스가 영어여도 한국어로 번역 (고유명사 제외).
+- "~로 알려졌다", "~할 것으로 보인다" 추측 표현 금지.
+- Do not include citation numbers like ([1]), ([2]) in any field.
 
-PROMPT_MIDTERM = ("""
+Respond with a single JSON object matching the required schema. No prose outside JSON.
+"""
+
+PROMPT_MIDTERM_PART_A = ("""
 당신은 미국 주식 뉴스를 분석하는 전문 애널리스트입니다.
-아래는 [{ticker}] 종목의 최근 {week_count}주간 데이터입니다.
+아래는 [{ticker}] 종목의 최근 {week_count}주간 주간 리포트입니다.
 
 === 주간 리포트 시퀀스 (과거 → 최근) ===
 {weekly_reports}
 
-=== 누적 성과 (참고용 사전 계산값 — 해석할 때만 활용, 출력 필드에 직접 적지 마세요) ===
+위 뉴스 흐름을 바탕으로 파트 A (뉴스 기반) 데이터를 JSON으로 작성하세요.
+
+───────────────────────────────
+작성 규칙 (반드시 준수)
+───────────────────────────────
+- [언어] 입력된 뉴스나 리포트가 영어로 되어 있어도, 모든 문장은 반드시
+  한국어로 번역해서 작성하세요. (인물명, 회사명, 티커 등 고유명사는 예외)
+- 모든 내용은 제공된 주간 리포트에 근거해야 합니다. 추측 금지.
+""" + _MIDTERM_PART_A_SCHEMA_RULES + """
+---
+Ticker: {ticker}
+""").strip()
+
+PROMPT_MIDTERM_PART_B = ("""
+당신은 미국 주식 투자 분석가입니다.
+[{ticker}] 종목의 중장기 성과 해석 및 종합 판단을 작성하세요.
+
+=== 누적 성과 (참고용 — 해석에만 활용, 출력 필드에 숫자 직접 적지 마세요) ===
 이 종목 누적 수익률: {stock_cumulative}%
 S&P500 누적 수익률: {sp500_cumulative}%
 {sector_name} 섹터({exchange}) 누적 수익률: {sector_cumulative}%
@@ -1291,23 +1328,15 @@ S&P500 누적 수익률: {sp500_cumulative}%
 === 같은 기간 {sector_name} 섹터 주간 뉴스 ===
 {sector_news}
 
-위 데이터를 바탕으로 중장기 리포트 데이터를 JSON으로 작성하세요.
+위 수치와 섹터 뉴스를 바탕으로 파트 B (수치/판단 기반) 데이터를 JSON으로 작성하세요.
 
 ───────────────────────────────
 작성 규칙 (반드시 준수)
 ───────────────────────────────
-- [언어] 입력된 뉴스나 리포트가 영어로 되어 있어도, 인용하는 모든 문장과
-  숫자 설명은 반드시 한국어로 번역해서 작성하세요. 영어 원문을 그대로
-  복사하거나 영어 단어를 섞어 쓰지 마세요. (인물명, 회사명, 티커 등
-  고유명사는 예외)
-- 모든 내용은 제공된 주간 리포트/섹터 뉴스에 근거해야 합니다. 추측 금지.
-- 사전 계산된 수치는 해석(benchmark_interpretation)에서만 참고하고,
-  JSON 출력 필드에 %/%p 숫자를 직접 적지 마세요.
-- "~로 알려졌다", "~할 것으로 보인다" 같은 추측성 표현 금지.
-- flow_narrative: 주차별 스토리를 변곡점 중심으로 서술. 단순 나열 금지.
-  최대 4~5문장으로 압축하세요.
-  (예: "1~3주차 실적 기대감 → 4주차 발표 후 반전 → 5~6주차 안정")
-""" + _MIDTERM_SCHEMA_RULES + """
+- [언어] 입력된 섹터 뉴스가 영어여도 한국어로 번역 (고유명사 제외).
+- benchmark_interpretation에 %/%p 숫자 직접 적지 마세요 (시스템이 자동 삽입).
+- "~로 알려졌다", "~할 것으로 보인다" 추측 표현 금지.
+""" + _MIDTERM_PART_B_SCHEMA_RULES + """
 ---
 Ticker: {ticker}
 """).strip()
@@ -1350,34 +1379,89 @@ def _format_sector_news_for_midterm(sector_news: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-def _build_midterm_template(
+def generate_midterm_part_a(
     ticker: str,
     weekly_reports: list[dict],
-) -> dict:
+) -> str | None:
     """
-    weekly_reports 1~2개인 경우 LLM 없이 템플릿 반환.
-    반환: {"summary_text": ..., "sentiment": None, "price_change_pct": None}
+    뉴스 기반 파트 A 생성 (weekly_reports >= 2일 때만).
+    반환: 렌더링된 텍스트 또는 None.
     """
-    n = len(weekly_reports)
-    dates_str = ", ".join(str(r.get("week_monday", "")) for r in weekly_reports)
-    lines = [
-        "[중장기 리포트]",
-        "",
-        f"최근 12주 내 주간 리포트 {n}건 ({dates_str})",
-        "",
-    ]
-    for r in weekly_reports:
-        wm = r.get("week_monday", "")
-        body = r.get("summary_text") or ""
-        lines.append(f"--- {wm} 주간 ---")
-        lines.append(body)
-        lines.append("")
-    lines.append("단편적인 뉴스만 있고 특별한 흐름은 없음.")
-    return {
-        "summary_text": "\n".join(lines),
-        "sentiment": None,
-        "price_change_pct": None,
-    }
+    if len(weekly_reports) < 2:
+        return None
+
+    week_count = len(weekly_reports)
+    prompt = PROMPT_MIDTERM_PART_A.format(
+        ticker=ticker,
+        week_count=week_count,
+        weekly_reports=_format_weekly_reports_for_midterm(weekly_reports),
+    )
+    logger.info(f"[{ticker}] midterm Part A 생성 ({week_count}주 기반)")
+    data = _generate_structured(
+        prompt, MidtermPartAData, ticker,
+        max_output_tokens=8000,
+        model=settings.gemini_model_lite,
+    )
+    if data is None:
+        return None
+    return render_midterm_part_a(data)
+
+
+def _generate_part_b_data(
+    ticker: str,
+    stock_cumulative: float,
+    sp500_cumulative: float,
+    sector_cumulative: float,
+    alpha_vs_market: float,
+    alpha_vs_sector: float,
+    sector_name: str,
+    exchange: str,
+    sector_news: list[dict],
+) -> MidtermPartBData | None:
+    """파트 B LLM 호출 → 구조화 데이터 반환 (내부용)."""
+    prompt = PROMPT_MIDTERM_PART_B.format(
+        ticker=ticker,
+        stock_cumulative=f"{stock_cumulative:+.2f}",
+        sp500_cumulative=f"{sp500_cumulative:+.2f}",
+        sector_name=sector_name,
+        exchange=exchange,
+        sector_cumulative=f"{sector_cumulative:+.2f}",
+        alpha_vs_market=f"{alpha_vs_market:+.2f}",
+        alpha_vs_sector=f"{alpha_vs_sector:+.2f}",
+        sector_news=_format_sector_news_for_midterm(sector_news),
+    )
+    logger.info(f"[{ticker}] midterm Part B 생성")
+    return _generate_structured(
+        prompt, MidtermPartBData, ticker,
+        max_output_tokens=4000,
+        model=settings.gemini_model_lite,
+    )
+
+
+def generate_midterm_part_b(
+    ticker: str,
+    stock_cumulative: float,
+    sp500_cumulative: float,
+    sector_cumulative: float,
+    alpha_vs_market: float,
+    alpha_vs_sector: float,
+    sector_name: str,
+    exchange: str,
+    sector_news: list[dict],
+) -> str:
+    """
+    수치/판단 기반 파트 B 텍스트 반환 (항상 반환).
+    LLM 실패 시 수치 헤더만 포함한 폴백 텍스트.
+    """
+    data = _generate_part_b_data(
+        ticker, stock_cumulative, sp500_cumulative, sector_cumulative,
+        alpha_vs_market, alpha_vs_sector, sector_name, exchange, sector_news,
+    )
+    return render_midterm_part_b(
+        data, sector_name, exchange,
+        stock_cumulative, sp500_cumulative, sector_cumulative,
+        alpha_vs_market, alpha_vs_sector,
+    )
 
 
 def summarize_midterm(
@@ -1392,61 +1476,49 @@ def summarize_midterm(
     """
     중장기 리포트 생성.
 
-    - weekly_reports 0개 → None (완전 스킵)
-    - weekly_reports 1~2개 → LLM 없이 템플릿 반환
-    - weekly_reports 3개 이상 → Gemini(Flash) 호출
+    - weekly_reports 0개 → None
+    - weekly_reports 1개 → Part A 없음, Part B만
+    - weekly_reports 2개 이상 → Part A + Part B
 
-    반환: {"summary_text", "sentiment" (nullable), "price_change_pct" (nullable)}
+    반환: {"summary_text", "sentiment" (nullable), "price_change_pct"}
     """
     if not weekly_reports:
         return None
 
-    if len(weekly_reports) <= 2:
-        return _build_midterm_template(ticker, weekly_reports)
-
-    week_count = len(weekly_reports)
     stock_series = [r.get("price_change_pct") for r in weekly_reports]
-
     stock_cumulative = _calc_cumulative(stock_series)
     sp500_cumulative = _calc_cumulative(sp500_series)
     sector_cumulative = _calc_cumulative(sector_series)
     alpha_vs_market = stock_cumulative - sp500_cumulative
     alpha_vs_sector = stock_cumulative - sector_cumulative
 
-    prompt = PROMPT_MIDTERM.format(
-        ticker=ticker,
-        week_count=week_count,
-        weekly_reports=_format_weekly_reports_for_midterm(weekly_reports),
-        stock_cumulative=f"{stock_cumulative:+.2f}",
-        sp500_cumulative=f"{sp500_cumulative:+.2f}",
-        sector_name=sector_name,
-        exchange=exchange,
-        sector_cumulative=f"{sector_cumulative:+.2f}",
-        alpha_vs_market=f"{alpha_vs_market:+.2f}",
-        alpha_vs_sector=f"{alpha_vs_sector:+.2f}",
-        sector_news=_format_sector_news_for_midterm(sector_news),
+    # Part A: 뉴스 기반 (2주 이상일 때만)
+    part_a_text = (
+        generate_midterm_part_a(ticker, weekly_reports)
+        if len(weekly_reports) >= 2 else None
     )
 
-    logger.info(f"[{ticker}] midterm 요약 시작 ({week_count}주 기반)")
-
-    data = _generate_structured(
-        prompt, MidtermReportData, ticker,
-        max_output_tokens=16000,
+    # Part B: 수치/판단 기반 (항상)
+    part_b_data = _generate_part_b_data(
+        ticker, stock_cumulative, sp500_cumulative, sector_cumulative,
+        alpha_vs_market, alpha_vs_sector, sector_name, exchange, sector_news,
     )
-    if data is None:
-        return None
-
-    sentiment = data.sentiment if data.sentiment in _VALID_WEEKLY_SENTIMENTS else "neutral"
-    summary_text = render_midterm_report(
-        data,
-        sector_name,
-        exchange,
-        stock_cumulative,
-        sp500_cumulative,
-        sector_cumulative,
-        alpha_vs_market,
-        alpha_vs_sector,
+    part_b_text = render_midterm_part_b(
+        part_b_data, sector_name, exchange,
+        stock_cumulative, sp500_cumulative, sector_cumulative,
+        alpha_vs_market, alpha_vs_sector,
     )
+
+    parts = [p for p in [part_a_text, part_b_text] if p]
+    summary_text = "\n\n".join(parts)
+
+    sentiment = None
+    if part_b_data is not None:
+        sentiment = (
+            part_b_data.sentiment
+            if part_b_data.sentiment in _VALID_WEEKLY_SENTIMENTS
+            else "neutral"
+        )
 
     return {
         "summary_text": summary_text,
@@ -1469,7 +1541,7 @@ def summarize_sector_news(articles: list[dict]) -> dict[str, dict] | None:
     prompt = PROMPT_SECTOR_NEWS_WEEKLY.format(articles=build_news_input(articles))
     logger.info(f"[SECTOR-NEWS] 섹터별 주간 요약 시작 (기사 {len(articles)}건)")
 
-    summary_text = _generate_content(prompt, "SECTOR")
+    summary_text = _generate_content(prompt, "SECTOR", model=settings.gemini_model_lite)
     if summary_text is None:
         return None
 

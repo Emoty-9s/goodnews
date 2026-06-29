@@ -99,9 +99,9 @@ async def get_summary(
         select(NewsSummary).where(
             NewsSummary.ticker == ticker,
             NewsSummary.digest_type == digest_type,
-        )
+        ).order_by(NewsSummary.updated_at.desc()).limit(1)
     )
-    summary = result.scalar_one_or_none()
+    summary = result.scalars().first()
 
     if not summary:
         raise HTTPException(

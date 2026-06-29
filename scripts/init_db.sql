@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS news_summaries (
     version           VARCHAR(10),
     summary_text      TEXT,
     sentiment         VARCHAR(10)
-                        CHECK (sentiment IN ('bullish', 'bearish', 'mixed', 'neutral')),
+                        CHECK (sentiment IN ('positive', 'negative', 'mixed', 'neutral')),
     source_urls       JSONB         DEFAULT '[]'::jsonb,
     price_change_pct  FLOAT,
     updated_at        TIMESTAMPTZ   DEFAULT NOW()
@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS sector_news_summaries (
     week_monday    DATE          NOT NULL,
     summary_text   TEXT,
     sentiment      VARCHAR(10)
-                     CHECK (sentiment IN ('bullish', 'bearish', 'mixed', 'neutral')),
+                     CHECK (sentiment IN ('positive', 'negative', 'mixed', 'neutral')),
 
     CONSTRAINT sector_news_summaries_pkey
         PRIMARY KEY (category, week_monday)

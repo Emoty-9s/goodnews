@@ -29,6 +29,7 @@ from app.scheduler.price_collector import (
     fetch_sp500_weekly_change,
 )
 from app.summarizer.llm_summarizer import (
+    generate_midterm_part_b,
     summarize_midterm,
     summarize_sector_news,
     summarize_ticker,
@@ -731,6 +732,166 @@ async def run_midterm(
     return stats
 
 # ──────────────────────────────────────────
+# Midterm Part B 갱신 (금요일 22:30 ET)
+# ──────────────────────────────────────────
+
+_PART_B_MARKER = "[누적 성과 vs 벤치마크]"
+
+
+def _replace_part_b(summary_text: str, new_part_b: str) -> str:
+    """summary_text에서 '[누적 성과 vs 벤치마크]' 이후를 new_part_b로 교체."""
+    idx = summary_text.find(_PART_B_MARKER)
+    if idx == -1:
+        # 파트 A 없는 종목 → 파트 B 전체로 덮어씀
+        return new_part_b
+    part_a = summary_text[:idx].rstrip()
+    return (part_a + "\n\n" + new_part_b) if part_a else new_part_b
+
+
+def _cumulative_return(series: list) -> float:
+    """None 제외한 주간 수익률 시퀀스 복리 합산. % 단위 반환."""
+    factor = 1.0
+    for x in series:
+        if x is not None:
+            factor *= (1 + x / 100)
+    return (factor - 1) * 100
+
+
+async def _get_current_midterm(ticker: str) -> dict | None:
+    """현재 midterm 리포트(가장 최근 1건) 조회. 없으면 None."""
+    from app.models.database import AsyncSessionLocal
+    from sqlalchemy import text as sa_text
+    async with AsyncSessionLocal() as session:
+        r = await session.execute(
+            sa_text(
+                "SELECT report_date, summary_text, sentiment, price_change_pct "
+                "FROM news_summaries "
+                "WHERE ticker = :t AND digest_type = 'midterm' "
+                "ORDER BY report_date DESC LIMIT 1"
+            ),
+            {"t": ticker.upper()},
+        )
+        row = r.fetchone()
+        if row is None:
+            return None
+        return {
+            "report_date": row[0],
+            "summary_text": row[1] or "",
+            "sentiment": row[2],
+            "price_change_pct": row[3],
+        }
+
+
+async def run_refresh_midterm_part_b(test_tickers: list[str] | None = None):
+    """
+    금요일 22:30 ET 실행 — 전체 종목의 midterm 파트 B를
+    이번 주 최신 수치로 갱신. 파트 A(뉴스 기반)는 건드리지 않음.
+
+    weekly_midterm(22:00) 완료 후 실행.
+    """
+    CONCURRENCY = 10
+    et_now = datetime.now(ET)
+    week_monday = _week_monday(et_now.date())
+    tickers = test_tickers if test_tickers else load_all_tickers()
+    total = len(tickers)
+    logger.info(
+        f"===== [REFRESH-MIDTERM-PART-B] 시작 "
+        f"(week_monday={week_monday}, 종목 {total:,}개) ====="
+    )
+
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    counter = [0]
+    stats = {"ok": 0, "skip": 0, "fail": 0}
+
+    async def _one(ticker: str) -> None:
+        async with semaphore:
+            try:
+                current = await _get_current_midterm(ticker)
+                if current is None:
+                    stats["skip"] += 1
+                    return
+
+                weekly_reports = await get_recent_weekly_finals_for_midterm(
+                    ticker, before=week_monday + timedelta(days=1)
+                )
+                if not weekly_reports:
+                    stats["skip"] += 1
+                    return
+
+                sector_info = await get_ticker_sector_exchange(ticker)
+                if sector_info is None:
+                    stats["skip"] += 1
+                    return
+                sector_name, exchange = sector_info
+
+                week_mondays_list = [
+                    r["week_monday"] if isinstance(r["week_monday"], date)
+                    else r["week_monday"].date()
+                    for r in weekly_reports
+                ]
+                benchmarks = await get_weekly_benchmarks_series(
+                    week_mondays_list, sector_name, exchange
+                )
+                sector_news = await get_sector_news_series(sector_name, week_mondays_list)
+
+                stock_cumulative = _cumulative_return(
+                    [r.get("price_change_pct") for r in weekly_reports]
+                )
+                sp500_cumulative = _cumulative_return(benchmarks["sp500"])
+                sector_cumulative = _cumulative_return(benchmarks["sector"])
+                alpha_vs_market = stock_cumulative - sp500_cumulative
+                alpha_vs_sector = stock_cumulative - sector_cumulative
+
+                new_part_b = await asyncio.to_thread(
+                    generate_midterm_part_b,
+                    ticker,
+                    stock_cumulative,
+                    sp500_cumulative,
+                    sector_cumulative,
+                    alpha_vs_market,
+                    alpha_vs_sector,
+                    sector_name,
+                    exchange,
+                    sector_news,
+                )
+
+                new_summary = _replace_part_b(current["summary_text"], new_part_b)
+                await upsert_midterm(
+                    ticker=ticker,
+                    report_date=current["report_date"],
+                    summary_text=new_summary,
+                    sentiment=current["sentiment"],   # 파트 A의 sentiment 유지
+                    price_change_pct=stock_cumulative,
+                )
+                stats["ok"] += 1
+
+            except Exception as e:
+                logger.error(f"[REFRESH-MIDTERM-PART-B][{ticker}] 처리 실패: {e}")
+                stats["fail"] += 1
+
+        counter[0] += 1
+        if counter[0] % 500 == 0 or counter[0] == total:
+            logger.info(
+                f"[refresh_midterm_part_b] 진행 {counter[0]:,}/{total:,}"
+            )
+
+    await asyncio.gather(*(_one(t) for t in tickers))
+
+    logger.info(
+        f"===== [REFRESH-MIDTERM-PART-B] 완료: "
+        f"ok={stats['ok']} skip={stats['skip']} fail={stats['fail']} ====="
+    )
+    if stats["fail"] > 0:
+        send_alert(
+            title="⚠️ refresh_midterm_part_b 완료 (일부 실패)",
+            message=(
+                f"성공: {stats['ok']} / 실패: {stats['fail']} / 스킵: {stats['skip']}\n"
+                f"실패 종목은 다음 주 실행에서 재시도됩니다."
+            ),
+        )
+
+
+# ──────────────────────────────────────────
 # Celery 태스크 정의
 # ──────────────────────────────────────────
 
@@ -760,6 +921,10 @@ def task_weekly_midterm():
     week_monday = _week_monday(et_now.date())
     tickers = load_all_tickers()
     asyncio.run(run_midterm(tickers, week_monday))
+
+@celery_app.task(name="tasks.refresh_midterm_part_b")
+def task_refresh_midterm_part_b():
+    asyncio.run(run_refresh_midterm_part_b())
 
 @celery_app.task(name="tasks.daily_digest")
 def task_daily_digest():
@@ -801,6 +966,13 @@ celery_app.conf.beat_schedule = {
     "weekly-midterm": {
         "task": "tasks.weekly_midterm",
         "schedule": crontab(day_of_week="friday", hour=22, minute=0),
+    },
+    # Midterm Part B 갱신: 매주 금요일 22:30 ET (weekly_midterm 완료 후)
+    # 전체 종목의 파트 B(수치/판단)를 이번 주 최신 벤치마크로 교체.
+    # 파트 A(뉴스 기반)는 건드리지 않음.
+    "weekly-refresh-midterm-part-b": {
+        "task": "tasks.refresh_midterm_part_b",
+        "schedule": crontab(day_of_week="friday", hour=22, minute=30),
     },
 
 }

@@ -16,9 +16,10 @@ settings = get_settings()
 engine = create_async_engine(
     settings.database_url,
     echo=False,
-    pool_size=20,       # 기본 5 → 동시성 늘릴 때를 대비해 상향
-    max_overflow=20,    # 기본 10 → 합쳐서 최대 40개 동시 커넥션
-    pool_timeout=30,
+    pool_size=5,        # Supabase 세션 모드 한계(15) 이내로 유지
+    max_overflow=5,     # 최대 동시 커넥션 = pool_size + max_overflow = 10
+    pool_timeout=60,    # 풀 빌리기 대기 시간 (초) — backfill 중 큐가 밀릴 때를 대비
+    pool_pre_ping=True, # 유휴 커넥션 재사용 전 생존 확인 (긴 backfill 중 끊김 방지)
     connect_args={
         # Supabase Supavisor 트랜잭션 모드(포트 6543) 사용 시 필수.
         # 트랜잭션 모드는 커넥션을 요청마다 재배정하므로
