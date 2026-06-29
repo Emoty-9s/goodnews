@@ -18,6 +18,7 @@ from loguru import logger
 
 from app.core.config import get_settings
 from app.core.alerting import send_alert
+from app.scheduler.macro_collector import fetch_macro_indicators
 from app.scheduler.fmp_collector import (
     FMPNewsCollector,
     fetch_general_news,
@@ -41,12 +42,14 @@ from app.models.database import (
     delete_closing_for_overnight,
     delete_draft_for_final,
     delete_old_daily_reports,
+    delete_old_macro_indicators,
     delete_old_news_articles,
     delete_old_weekly_data,
     get_articles_for_ticker_between,
     get_closing_report,
     get_daily_reports,
     get_last_midterm_date,
+    get_latest_macro_snapshot,
     get_market_news_for_week,
     get_recent_weekly_finals_for_midterm,
     get_sector_news_series,
@@ -782,6 +785,43 @@ async def _get_current_midterm(ticker: str) -> dict | None:
         }
 
 
+def _format_macro_data(snapshot: dict[str, dict]) -> str:
+    """거시 지표 snapshot → 프롬프트용 텍스트 블록."""
+    if not snapshot:
+        return "(거시 데이터 없음)"
+
+    LABEL: dict[str, tuple[str, str]] = {
+        "gdp":            ("GDP 성장률",       "분기"),
+        "cpi":            ("CPI 소비자물가",    "월간"),
+        "core_cpi":       ("Core CPI 근원물가", "월간"),
+        "ppi":            ("PPI 생산자물가",    "월간"),
+        "unemployment":   ("실업률",           "월간"),
+        "nfp":            ("비농업 고용(NFP)",  "월간"),
+        "fed_funds_rate": ("기준금리",         ""),
+        "treasury_10y":   ("10년 국채금리",    ""),
+        "ism_mfg":        ("ISM 제조업 PMI",   "월간"),
+        "ism_svc":        ("ISM 서비스업 PMI", "월간"),
+    }
+    lines = []
+    for key, (label, period) in LABEL.items():
+        d = snapshot.get(key)
+        if d is None:
+            continue
+        val = d.get("value")
+        prev = d.get("previous")
+        unit = d.get("unit", "%")
+        date_str = d.get("date", "")
+
+        change = ""
+        if val is not None and prev is not None:
+            diff = val - prev
+            change = f" (전월比 {diff:+.2f}{unit})"
+
+        period_str = f" [{period}]" if period else ""
+        lines.append(f"- {label}{period_str}: {val}{unit}{change} (기준일: {date_str})")
+    return "\n".join(lines)
+
+
 async def run_refresh_midterm_part_b(test_tickers: list[str] | None = None):
     """
     금요일 22:30 ET 실행 — 전체 종목의 midterm 파트 B를
@@ -798,6 +838,10 @@ async def run_refresh_midterm_part_b(test_tickers: list[str] | None = None):
         f"===== [REFRESH-MIDTERM-PART-B] 시작 "
         f"(week_monday={week_monday}, 종목 {total:,}개) ====="
     )
+
+    # 거시 데이터는 전 종목 공통 — 한 번만 조회
+    macro_snapshot = await get_latest_macro_snapshot()
+    macro_data = _format_macro_data(macro_snapshot)
 
     semaphore = asyncio.Semaphore(CONCURRENCY)
     counter = [0]
@@ -853,6 +897,7 @@ async def run_refresh_midterm_part_b(test_tickers: list[str] | None = None):
                     sector_name,
                     exchange,
                     sector_news,
+                    macro_data,
                 )
 
                 new_summary = _replace_part_b(current["summary_text"], new_part_b)
@@ -926,6 +971,20 @@ def task_weekly_midterm():
 def task_refresh_midterm_part_b():
     asyncio.run(run_refresh_midterm_part_b())
 
+
+@celery_app.task(name="tasks.macro_collect")
+def task_macro_collect():
+    """
+    매주 금요일 21:15 ET — 거시경제 지표 수집 + 오래된 데이터 삭제.
+    weekly-final(21:00) 완료 후, weekly-sector-news(21:30) 이전 실행.
+    """
+    async def _run():
+        count = await fetch_macro_indicators()
+        deleted = await delete_old_macro_indicators(months=6)
+        logger.info(f"[MACRO] 수집 {count}건, 삭제 {deleted}건")
+    asyncio.run(_run())
+
+
 @celery_app.task(name="tasks.daily_digest")
 def task_daily_digest():
     asyncio.run(run_digest_batch("daily"))
@@ -955,6 +1014,11 @@ celery_app.conf.beat_schedule = {
     "weekly-final": {
         "task": "tasks.weekly_final",
         "schedule": crontab(day_of_week="friday", hour=21, minute=0),
+    },
+    # 거시 지표 수집: 매주 금요일 21:15 ET (weekly-final 완료 후, sector-news 이전)
+    "weekly-macro-collect": {
+        "task": "tasks.macro_collect",
+        "schedule": crontab(day_of_week="friday", hour=21, minute=15),
     },
     # Weekly 섹터 시장 뉴스: 매주 금요일 21:30 ET (weekly-final 30분 후)
     "weekly-sector-news": {

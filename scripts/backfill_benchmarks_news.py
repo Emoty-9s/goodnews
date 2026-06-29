@@ -29,6 +29,7 @@ from app.scheduler.price_collector import (
     fetch_sp500_weekly_change,
 )
 from app.summarizer.llm_summarizer import summarize_sector_news
+from app.scheduler.macro_collector import fetch_macro_indicators
 
 # ──────────────────────────────────────────
 # 대상 주차 (월요일 리스트)
@@ -137,6 +138,13 @@ async def run_phase_c():
         logger.info(f"[C] {week_monday} 완료 — {len(result)}개 카테고리")
 
 
+async def run_phase_d():
+    """거시경제 지표 소급 수집 (최근 3개월치)."""
+    logger.info("===== Phase D: 거시경제 지표 수집 =====")
+    count = await fetch_macro_indicators()
+    logger.info(f"[D] 완료 — {count}건 저장")
+
+
 # ──────────────────────────────────────────
 # 엔트리포인트
 # ──────────────────────────────────────────
@@ -146,6 +154,7 @@ async def main():
     await run_phase_a()
     await run_phase_b()
     await run_phase_c()
+    await run_phase_d()
     logger.info("===== 백필 완료 =====")
 
 

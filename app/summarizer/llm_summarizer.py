@@ -334,7 +334,7 @@ Rules:
   * When in doubt → 중립
 - Classify ALL relevant news items into positives / negatives / neutral_items.
   neutral_items also covers sector-wide or macro news with unclear ticker-specific impact.
-- temperature_gap: Find where positive and negative news collide,
+- context_note: Find where positive and negative news collide,
   OR explain why the market is moving against the news.
   If no contradiction exists, describe the single dominant theme.
 - checkpoint_section (market_reaction / checkpoint): This is NOT a "market is wrong,
@@ -350,10 +350,18 @@ Rules:
   or "이유:" — just state the reasoning directly.
 - Do not include citation numbers like ([1]), ([2]), ([3])
   in any field. Never reference source numbers.
-- Each bullet-like string (positives, negatives, neutral_items, next_watch)
-  must be a single self-contained item, maximum 2 Korean sentences.
-- If positives/negatives/neutral_items have nothing to report, return an empty list,
-  NOT a string like "없음".
+- positives/negatives/neutral_items: 각 항목은 {"content": "...", "category": "..."} 형태.
+  category는 다음 5개 중 정확히 하나: 실적_재무, 사업_운영, 시장평가, 경영_인사, 거시_섹터
+
+  실적_재무: 어닝 비트/미스, 매출 증가/감소, 가이던스 상향/하향, 마진 변화
+  사업_운영: 계약/파트너십 체결(금액 명시), 신제품 출시, FDA 승인, 리콜, 생산 중단, 소송
+  시장평가: 목표주가 상향/하향, 투자의견 업/다운그레이드, 커버리지 개시
+  경영_인사: CEO/핵심 인력 변화, 자사주 매입, 배당 변경, 구조조정
+  거시_섹터: 규제 강화/완화, 관세, 정책, 업황, 조사 착수
+
+  next_watch 항목은 단순 문자열 (카테고리 불필요).
+  각 항목(content)은 최대 2문장 이내 한국어로.
+  positives/negatives/neutral_items에 해당 내용이 없으면 빈 리스트 [] 반환.
 - sentiment must be exactly one of: positive, negative, mixed, neutral.
 
 Respond with a single JSON object matching the required schema. No prose outside JSON.
@@ -385,21 +393,20 @@ class CheckpointSection(BaseModel):
     checkpoint: str | None = None
 
 
-class InvestorView(BaseModel):
-    short_term: str
-    long_term: str
+class CategorizedItem(BaseModel):
+    content: str
+    category: str  # WEEKLY_CATEGORIES 중 하나
 
 
 class FullReportData(BaseModel):
     headline: str
-    positives: list[str] = []
-    negatives: list[str] = []
-    neutral_items: list[str] = []
-    temperature_gap: str
+    positives: list[CategorizedItem] = []
+    negatives: list[CategorizedItem] = []
+    neutral_items: list[CategorizedItem] = []
+    context_note: str
     checkpoint_section: CheckpointSection | None = None
     sentiment: str  # positive / negative / mixed / neutral
     sentiment_reason: str
-    investor_view: InvestorView
     next_watch: list[str] = []
 
 
@@ -432,9 +439,6 @@ def render_full_report(data: FullReportData) -> str:
     글자 단위로 동일한 골격을 만든다. 값이 비어 있을 때의 처리
     (예: "없음")도 여기서 결정론적으로 처리한다.
     """
-    positives = _dedup_keep_order(data.positives)
-    negatives = _dedup_keep_order(data.negatives)
-    neutral_items = _dedup_keep_order(data.neutral_items)
     next_watch = _dedup_keep_order(data.next_watch)
 
     lines: list[str] = []
@@ -442,20 +446,12 @@ def render_full_report(data: FullReportData) -> str:
     lines.append(data.headline.strip())
     lines.append("")
 
-    lines.append("[호재]")
-    lines.extend(f"- {x}" for x in positives) if positives else lines.append("- 없음")
-    lines.append("")
+    _render_categorized_section("[호재]", data.positives, None, lines)
+    _render_categorized_section("[악재 및 우려]", data.negatives, None, lines)
+    _render_categorized_section("[중립/매크로]", data.neutral_items, None, lines)
 
-    lines.append("[악재 및 우려]")
-    lines.extend(f"- {x}" for x in negatives) if negatives else lines.append("- 없음")
-    lines.append("")
-
-    lines.append("[중립/매크로]")
-    lines.extend(f"- {x}" for x in neutral_items) if neutral_items else lines.append("- 없음")
-    lines.append("")
-
-    lines.append("[오늘의 온도차]")
-    lines.append(data.temperature_gap.strip())
+    lines.append("[오늘의 맥락]")
+    lines.append(data.context_note.strip())
     lines.append("")
 
     cps = data.checkpoint_section
@@ -468,11 +464,6 @@ def render_full_report(data: FullReportData) -> str:
     sentiment_label = _SENTIMENT_TO_LABEL.get(data.sentiment, "중립")
     lines.append(f"[주가 영향] {sentiment_label}")
     lines.append(data.sentiment_reason.strip())
-    lines.append("")
-
-    lines.append("[투자자 관점]")
-    lines.append(f"단기: {data.investor_view.short_term.strip()}")
-    lines.append(f"장기: {data.investor_view.long_term.strip()}")
     lines.append("")
 
     lines.append("[다음에 체크해야 할 뉴스]")
@@ -503,11 +494,6 @@ WEEKLY_CATEGORIES = [
     "경영_인사",   # CEO/경영진 변화, 자사주매입, 배당, 구조조정
     "거시_섹터",   # 규제, 정책, 업황, 관세, 조사
 ]
-
-
-class CategorizedItem(BaseModel):
-    content: str
-    category: str  # WEEKLY_CATEGORIES 중 하나
 
 
 class WeeklyReportData(BaseModel):
@@ -815,13 +801,13 @@ def summarize_ticker(ticker: str, news_list: list[dict], digest_type: str) -> di
 
 
 # ──────────────────────────────────────────
-# Phase2: premarket 업데이트 요약
+# Phase2: overnight 업데이트 요약
 # ──────────────────────────────────────────
 
 PROMPT_UPDATE = """You are a stock news analyst for individual retail investors in Korea.
 
 기존에 작성된 closing 리포트와, 그 이후 밤사이 추가된 새 뉴스가 주어집니다.
-새 뉴스를 반영해 기존 리포트를 업데이트한 premarket 리포트를 작성하세요.
+새 뉴스를 반영해 기존 리포트를 업데이트한 overnight 리포트를 작성하세요.
 
 Rules:
 - 기존 리포트 내용을 기반으로 하되, 새 뉴스로 바뀐 부분을 반영/보강한다.
@@ -862,7 +848,7 @@ Ticker: {ticker}
 
 def summarize_update(ticker: str, existing_report, new_articles: list[dict]) -> dict | None:
     """
-    기존 closing 리포트 + 밤사이 새 뉴스로 premarket 리포트 생성 (Phase2).
+    기존 closing 리포트 + 밤사이 새 뉴스로 overnight 리포트 생성 (Phase2).
 
     existing_report 가 없으면 새 뉴스만으로 일반 요약을 생성한다.
     Gemini 호출 실패 시 None 반환.
@@ -877,7 +863,7 @@ def summarize_update(ticker: str, existing_report, new_articles: list[dict]) -> 
             "source_urls": [],
         }
 
-    logger.info(f"[{ticker}] premarket 업데이트 요약 시작 ({len(new_articles)}건)")
+    logger.info(f"[{ticker}] overnight 업데이트 요약 시작 ({len(new_articles)}건)")
 
     news_input = build_news_input(new_articles)
     if existing_report:
@@ -1328,6 +1314,9 @@ S&P500 누적 수익률: {sp500_cumulative}%
 === 같은 기간 {sector_name} 섹터 주간 뉴스 ===
 {sector_news}
 
+=== 최근 거시경제 지표 ===
+{macro_data}
+
 위 수치와 섹터 뉴스를 바탕으로 파트 B (수치/판단 기반) 데이터를 JSON으로 작성하세요.
 
 ───────────────────────────────
@@ -1336,6 +1325,9 @@ S&P500 누적 수익률: {sp500_cumulative}%
 - [언어] 입력된 섹터 뉴스가 영어여도 한국어로 번역 (고유명사 제외).
 - benchmark_interpretation에 %/%p 숫자 직접 적지 마세요 (시스템이 자동 삽입).
 - "~로 알려졌다", "~할 것으로 보인다" 추측 표현 금지.
+- macro_analysis: 위 거시 지표 중 이 종목에 직접 영향을 주는 지표만 골라
+  해당 종목 관점에서 해석하세요. 거시 요약이 아니라 "이 종목에 미치는 영향"
+  관점으로 2~3문장. 무관한 지표는 언급하지 마세요.
 """ + _MIDTERM_PART_B_SCHEMA_RULES + """
 ---
 Ticker: {ticker}
@@ -1417,6 +1409,7 @@ def _generate_part_b_data(
     sector_name: str,
     exchange: str,
     sector_news: list[dict],
+    macro_data: str = "",
 ) -> MidtermPartBData | None:
     """파트 B LLM 호출 → 구조화 데이터 반환 (내부용)."""
     prompt = PROMPT_MIDTERM_PART_B.format(
@@ -1429,6 +1422,7 @@ def _generate_part_b_data(
         alpha_vs_market=f"{alpha_vs_market:+.2f}",
         alpha_vs_sector=f"{alpha_vs_sector:+.2f}",
         sector_news=_format_sector_news_for_midterm(sector_news),
+        macro_data=macro_data,
     )
     logger.info(f"[{ticker}] midterm Part B 생성")
     return _generate_structured(
@@ -1448,6 +1442,7 @@ def generate_midterm_part_b(
     sector_name: str,
     exchange: str,
     sector_news: list[dict],
+    macro_data: str = "",
 ) -> str:
     """
     수치/판단 기반 파트 B 텍스트 반환 (항상 반환).
@@ -1456,6 +1451,7 @@ def generate_midterm_part_b(
     data = _generate_part_b_data(
         ticker, stock_cumulative, sp500_cumulative, sector_cumulative,
         alpha_vs_market, alpha_vs_sector, sector_name, exchange, sector_news,
+        macro_data=macro_data,
     )
     return render_midterm_part_b(
         data, sector_name, exchange,

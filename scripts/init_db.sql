@@ -120,6 +120,24 @@ CREATE INDEX IF NOT EXISTS idx_sns_week_monday
     ON sector_news_summaries (week_monday DESC);
 
 
+-- ────────────────────────────────────────
+-- 6. macro_indicators
+--    거시경제 지표 (주 1회 수집, 최신값 유지)
+-- ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS macro_indicators (
+    name        VARCHAR(50)   NOT NULL,   -- 'cpi', 'fed_funds_rate', 'nfp' 등
+    date        DATE          NOT NULL,   -- 발표일
+    value       FLOAT,                   -- 실측값
+    previous    FLOAT,                   -- 전월/전분기값
+    estimate    FLOAT,                   -- 예상치 (있을 때만)
+    unit        VARCHAR(20),             -- '%', 'K', 'index' 등
+    CONSTRAINT macro_indicators_pkey PRIMARY KEY (name, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_macro_name_date
+    ON macro_indicators (name, date DESC);
+
+
 -- ============================================================
 -- 보관 정책 요약 (코드 자동 삭제 기준)
 -- ============================================================
@@ -130,4 +148,5 @@ CREATE INDEX IF NOT EXISTS idx_sns_week_monday
 -- market_news_articles      → 7일    delete_old_news_articles()
 -- weekly_benchmarks         → 12주   delete_old_weekly_data()
 -- sector_news_summaries     → 12주   delete_old_weekly_data()
+-- macro_indicators          → 6개월  delete_old_macro_indicators()
 -- ============================================================

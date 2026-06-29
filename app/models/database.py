@@ -43,7 +43,7 @@ class NewsSummary(Base):
     주식 종목별 AI 요약 테이블
     키: (ticker, digest_type, report_date)
 
-    NOTE: report_date 는 daily 전용(NULL 허용). 비-daily(weekly/monthly/yearly)는 NULL.
+    NOTE: report_date 는 daily 전용(NULL 허용). 비-daily(weekly/midterm)는 NULL.
     Supabase 실테이블은 UNIQUE (ticker, digest_type, report_date) NULLS NOT DISTINCT 로
     관리되어 NULL 도 충돌 키로 동작한다(마이그레이션으로 적용). ORM 매핑상으로는
     세 컬럼을 primary_key 로 선언한다.
@@ -53,7 +53,7 @@ class NewsSummary(Base):
     ticker = Column(String(10), primary_key=True, comment="주식 티커 (예: AAPL)")
     digest_type = Column(
         String(10), primary_key=True,
-        comment="요약 주기: daily | weekly | monthly | yearly"
+        comment="요약 주기: daily | weekly | midterm"
     )
     report_date = Column(
         Date, primary_key=True, nullable=True,
@@ -61,10 +61,10 @@ class NewsSummary(Base):
     )
     version = Column(
         String(10), nullable=True,
-        comment="closing | premarket | None (daily 전용)"
+        comment="closing | overnight | None (daily 전용)"
     )
     summary_text = Column(Text, nullable=True, comment="AI 요약 텍스트 (마크다운)")
-    sentiment = Column(String(10), nullable=True, comment="bullish | bearish | neutral")
+    sentiment = Column(String(10), nullable=True, comment="positive | negative | mixed | neutral")
     source_urls = Column(JSON, nullable=True, comment="원문 뉴스 URL 리스트")
     price_change_pct = Column(
         Float, nullable=True,
@@ -931,3 +931,50 @@ async def upsert_midterm(
             },
         )
         await session.commit()
+
+
+async def get_latest_macro_snapshot() -> dict[str, dict]:
+    """
+    macro_indicators 테이블에서 지표별 가장 최근 1건씩 조회.
+    반환: {'cpi': {'value': 3.2, 'date': '2026-05-10', 'previous': 3.0, 'unit': '%'}, ...}
+    없으면 빈 dict.
+    """
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT DISTINCT ON (name) name, date, value, previous, unit
+                FROM macro_indicators
+                ORDER BY name, date DESC
+                """
+            )
+        )
+        rows = result.mappings().all()
+    return {
+        row["name"]: {
+            "value": row["value"],
+            "date": str(row["date"]),
+            "previous": row["previous"],
+            "unit": row["unit"] or "",
+        }
+        for row in rows
+    }
+
+
+async def delete_old_macro_indicators(months: int = 6) -> int:
+    """
+    macro_indicators에서 오늘 기준 months개월 초과된 데이터 삭제.
+    삭제 건수 반환.
+    """
+    cutoff = date.today() - timedelta(days=months * 30)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            text(
+                "DELETE FROM macro_indicators WHERE date < :cutoff"
+            ),
+            {"cutoff": cutoff},
+        )
+        await session.commit()
+    deleted = result.rowcount
+    logger.info(f"[MACRO] 오래된 지표 삭제: {deleted}건 (cutoff={cutoff})")
+    return deleted
