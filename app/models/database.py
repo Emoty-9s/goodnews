@@ -989,6 +989,11 @@ _UNIVERSE_INSERT_COLS = (
 )
 
 
+def _is_nan(v) -> bool:
+    """pandas NaN (float) 여부 확인."""
+    return isinstance(v, float) and v != v
+
+
 def _coerce_universe_row(row: dict) -> dict | None:
     """DataFrame.to_dict 행을 DB INSERT 용 dict 로 정규화. symbol 없으면 None."""
     sym = row.get("symbol")
@@ -998,6 +1003,14 @@ def _coerce_universe_row(row: dict) -> dict | None:
     out: dict = {c: row.get(c) for c in _UNIVERSE_INSERT_COLS}
     out["symbol"] = str(sym).strip().upper()
 
+    # TEXT 컬럼 — pandas NaN(float) → None (asyncpg는 TEXT에 float NaN 허용 안 함)
+    for c in ("company_name", "exchange", "exchange_short_name",
+              "country", "currency", "sector", "industry",
+              "universe_status", "snapshot_date"):
+        v = out.get(c)
+        if _is_nan(v):
+            out[c] = None
+
     # float 컬럼 — NaN → None
     for c in ("market_cap", "price", "beta", "volume"):
         v = out.get(c)
@@ -1005,7 +1018,7 @@ def _coerce_universe_row(row: dict) -> dict | None:
             continue
         try:
             fv = float(v)
-            out[c] = None if fv != fv else fv  # NaN check
+            out[c] = None if _is_nan(fv) else fv
         except (TypeError, ValueError):
             out[c] = None
 
@@ -1015,14 +1028,34 @@ def _coerce_universe_row(row: dict) -> dict | None:
         pass
     elif isinstance(v, str):
         out["is_actively_trading"] = v.strip().lower() in ("true", "1", "yes")
-    elif v is None or (isinstance(v, float) and v != v):
+    elif v is None or _is_nan(v):
         out["is_actively_trading"] = None
     else:
         out["is_actively_trading"] = bool(v)
 
-    # created_at_utc — 없으면 현재 시각
-    if not out.get("created_at_utc"):
-        out["created_at_utc"] = datetime.now(timezone.utc).isoformat()
+    # DATE 컬럼 — 문자열 → datetime.date (asyncpg는 date 객체 요구)
+    v = out.get("snapshot_date")
+    if v is None or _is_nan(v):
+        out["snapshot_date"] = None
+    elif isinstance(v, str):
+        try:
+            out["snapshot_date"] = date.fromisoformat(v[:10])
+        except (ValueError, TypeError):
+            out["snapshot_date"] = None
+    elif not isinstance(v, date):
+        out["snapshot_date"] = None
+
+    # TIMESTAMPTZ 컬럼 — 문자열 → datetime (asyncpg는 datetime 객체 요구)
+    v = out.get("created_at_utc")
+    if v is None or _is_nan(v):
+        out["created_at_utc"] = datetime.now(timezone.utc)
+    elif isinstance(v, str):
+        try:
+            out["created_at_utc"] = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            out["created_at_utc"] = datetime.now(timezone.utc)
+    elif not isinstance(v, datetime):
+        out["created_at_utc"] = datetime.now(timezone.utc)
 
     return out
 
