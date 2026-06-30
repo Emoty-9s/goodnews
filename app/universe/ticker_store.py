@@ -132,67 +132,59 @@ def _load_universe_metadata_df(path: str) -> pd.DataFrame:
     return out.drop_duplicates(subset=["symbol"], keep="first")
 
 
-def get_ticker_sector_exchange(
+async def get_ticker_sector_exchange(
     ticker: str,
     path: Optional[Path | str] = None,
 ) -> tuple[str, str] | None:
     """
     종목의 (sector, exchange_short_name) 반환 — weekly_benchmarks 매칭용.
 
-    데이터 소스: universe_current.csv (DB 테이블 없음).
-    sector / exchange 가 비어 있으면 None.
+    데이터 소스: Supabase universe_tickers 테이블.
+    로컬 디버깅용 CSV 조회: _load_universe_metadata_df() 직접 사용.
 
     Returns
     -------
     ("Technology", "NASDAQ") 또는 None
     """
-    target = str(Path(path) if path else DEFAULT_UNIVERSE_CSV)
-    df = _load_universe_metadata_df(target)
-    if df.empty:
+    from app.models.database import get_ticker_sector_exchange_from_db
+    try:
+        return await get_ticker_sector_exchange_from_db(ticker)
+    except Exception as e:
+        log.error("ticker_store: DB get_ticker_sector_exchange failed for %s: %s", ticker, e)
         return None
 
-    sym = (ticker or "").strip().upper()
-    if not sym:
-        return None
 
-    row = df.loc[df["symbol"] == sym]
-    if row.empty:
-        return None
-
-    sector = row.iloc[0].get("sector")
-    exchange = row.iloc[0].get("exchange_short_name")
-    if pd.isna(sector) or pd.isna(exchange):
-        return None
-    sector_s = str(sector).strip()
-    exchange_s = str(exchange).strip()
-    if not sector_s or not exchange_s:
-        return None
-    return sector_s, exchange_s
-
-
-def get_universe_tickers(path: Optional[Path | str] = None) -> list[str]:
+async def get_universe_tickers(path: Optional[Path | str] = None) -> list[str]:
     """
     스케줄러(tasks.py)의 load_all_tickers() 에서 호출하는 메인 인터페이스.
 
-    유니버스 CSV가 없으면 빈 리스트를 반환하고 경고를 남긴다.
-    (배치가 실행돼도 종목이 없으면 아무것도 하지 않으므로 안전하다.)
+    데이터 소스: Supabase universe_tickers 테이블.
+    DB가 비어있거나 연결 실패 시 빈 리스트 + 경고 로그.
+    로컬 CSV 조회: load_tickers_from_csv() 직접 사용.
     """
-    target = Path(path) if path else DEFAULT_UNIVERSE_CSV
-    tickers = load_tickers_from_csv(target)
+    from app.models.database import get_universe_tickers_from_db
+    try:
+        tickers = await get_universe_tickers_from_db()
+    except Exception as e:
+        log.error("ticker_store: DB load failed: %s", e)
+        return []
 
     if not tickers:
         log.warning(
-            "ticker_store: universe is empty. "
-            "News collection will be skipped until universe is built. "
-            "Run: python -m app.universe.build_universe --data-dir %s",
-            target.parent.resolve(),
+            "ticker_store: universe_tickers DB is empty. "
+            "News collection will be skipped. "
+            "Run: python scripts/upload_universe_to_supabase.py to populate."
         )
+    else:
+        log.info("ticker_store: loaded %d tickers from DB", len(tickers))
     return tickers
 
 
-def get_universe_stats(path: Optional[Path | str] = None) -> dict:
+async def get_universe_stats(path: Optional[Path | str] = None) -> dict:
     """
     유니버스 요약 통계 반환 (API 상태 엔드포인트·운영 모니터링용).
+
+    데이터 소스: Supabase universe_tickers 테이블.
 
     Returns
     -------
@@ -201,59 +193,18 @@ def get_universe_stats(path: Optional[Path | str] = None) -> dict:
         "by_exchange": {"NASDAQ": n, "NYSE": n, ...},
         "by_sector": {"Technology": n, ...},
         "snapshot_date": "2025-01-15" | None,
-        "source_file": str,
+        "source_file": "supabase:universe_tickers",
     }
     """
-    target = Path(path) if path else DEFAULT_UNIVERSE_CSV
-    result: dict = {
-        "total": 0,
-        "by_exchange": {},
-        "by_sector": {},
-        "snapshot_date": None,
-        "source_file": str(target),
-    }
-
-    if not target.exists():
-        return result
-
+    from app.models.database import get_universe_stats_from_db
     try:
-        df = pd.read_csv(target, low_memory=False)
-    except Exception:
-        return result
-
-    if "universe_status" in df.columns:
-        df = df[df["universe_status"] == "included"]
-
-    result["total"] = len(df)
-
-    if "exchange_short_name" in df.columns:
-        result["by_exchange"] = (
-            df["exchange_short_name"]
-            .dropna()
-            .value_counts()
-            .to_dict()
-        )
-    elif "exchange" in df.columns:
-        result["by_exchange"] = (
-            df["exchange"]
-            .dropna()
-            .value_counts()
-            .to_dict()
-        )
-
-    if "sector" in df.columns:
-        result["by_sector"] = (
-            df["sector"]
-            .dropna()
-            .replace("", pd.NA)
-            .dropna()
-            .value_counts()
-            .to_dict()
-        )
-
-    if "snapshot_date" in df.columns:
-        dates = df["snapshot_date"].dropna().unique()
-        if len(dates):
-            result["snapshot_date"] = str(dates[0])
-
-    return result
+        return await get_universe_stats_from_db()
+    except Exception as e:
+        log.error("ticker_store: DB get_universe_stats failed: %s", e)
+        return {
+            "total": 0,
+            "by_exchange": {},
+            "by_sector": {},
+            "snapshot_date": None,
+            "source_file": "error",
+        }

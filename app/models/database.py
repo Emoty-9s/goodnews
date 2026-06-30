@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -10,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.core.config import get_settings
+
+log = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -644,14 +647,8 @@ async def get_weekly_benchmarks(week_monday: date) -> dict:
 
 
 async def get_ticker_sector_exchange(ticker: str) -> tuple[str, str] | None:
-    """
-    종목의 (sector, exchange_short_name) 반환 — weekly_benchmarks 매칭용.
-
-    데이터 소스: universe_current.csv (별도 DB 테이블 없음).
-    """
-    from app.universe.ticker_store import get_ticker_sector_exchange as _lookup
-
-    return _lookup(ticker)
+    """종목의 (sector, exchange_short_name) 반환 — weekly_benchmarks 매칭용."""
+    return await get_ticker_sector_exchange_from_db(ticker)
 
 
 
@@ -976,5 +973,175 @@ async def delete_old_macro_indicators(months: int = 6) -> int:
         )
         await session.commit()
     deleted = result.rowcount
-    logger.info(f"[MACRO] 오래된 지표 삭제: {deleted}건 (cutoff={cutoff})")
+    log.info("[MACRO] 오래된 지표 삭제: %d건 (cutoff=%s)", deleted, cutoff)
     return deleted
+
+
+# ──────────────────────────────────────────
+# Universe tickers
+# ──────────────────────────────────────────
+
+_UNIVERSE_INSERT_COLS = (
+    "symbol", "company_name", "exchange", "exchange_short_name",
+    "country", "currency", "sector", "industry",
+    "market_cap", "price", "beta", "volume",
+    "is_actively_trading", "universe_status", "snapshot_date", "created_at_utc",
+)
+
+
+def _coerce_universe_row(row: dict) -> dict | None:
+    """DataFrame.to_dict 행을 DB INSERT 용 dict 로 정규화. symbol 없으면 None."""
+    sym = row.get("symbol")
+    if not sym or str(sym).strip().lower() in ("", "nan"):
+        return None
+
+    out: dict = {c: row.get(c) for c in _UNIVERSE_INSERT_COLS}
+    out["symbol"] = str(sym).strip().upper()
+
+    # float 컬럼 — NaN → None
+    for c in ("market_cap", "price", "beta", "volume"):
+        v = out.get(c)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+            out[c] = None if fv != fv else fv  # NaN check
+        except (TypeError, ValueError):
+            out[c] = None
+
+    # bool 컬럼
+    v = out.get("is_actively_trading")
+    if isinstance(v, bool):
+        pass
+    elif isinstance(v, str):
+        out["is_actively_trading"] = v.strip().lower() in ("true", "1", "yes")
+    elif v is None or (isinstance(v, float) and v != v):
+        out["is_actively_trading"] = None
+    else:
+        out["is_actively_trading"] = bool(v)
+
+    # created_at_utc — 없으면 현재 시각
+    if not out.get("created_at_utc"):
+        out["created_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+    return out
+
+
+async def upsert_universe_tickers(rows: list[dict]) -> int:
+    """
+    universe_tickers 테이블을 TRUNCATE 후 전체 INSERT.
+    symbol 기준 정규화 후 빈 rows는 스킵.
+    반환값: INSERT된 행 수.
+    """
+    coerced = [_coerce_universe_row(r) for r in rows]
+    coerced = [r for r in coerced if r is not None]
+    if not coerced:
+        return 0
+
+    col_names = ", ".join(_UNIVERSE_INSERT_COLS)
+    placeholders = ", ".join(f":{c}" for c in _UNIVERSE_INSERT_COLS)
+    insert_sql = text(
+        f"INSERT INTO universe_tickers ({col_names}) VALUES ({placeholders})"
+    )
+
+    async with AsyncSessionLocal() as session:
+        await session.execute(text("TRUNCATE TABLE universe_tickers"))
+        for i in range(0, len(coerced), 500):
+            await session.execute(insert_sql, coerced[i:i + 500])
+        await session.commit()
+
+    return len(coerced)
+
+
+async def get_universe_tickers_from_db(status_filter: str = "included") -> list[str]:
+    """
+    universe_tickers에서 universe_status + is_actively_trading=TRUE 필터링 후
+    symbol 목록 반환 (대문자, dedup).
+    """
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            text(
+                "SELECT symbol FROM universe_tickers "
+                "WHERE universe_status = :status AND is_actively_trading = TRUE "
+                "ORDER BY symbol"
+            ),
+            {"status": status_filter},
+        )
+        return [row[0].upper() for row in result.all() if row[0]]
+
+
+async def get_ticker_sector_exchange_from_db(ticker: str) -> tuple[str, str] | None:
+    """
+    특정 종목의 (sector, exchange_short_name) 반환.
+    종목이 없거나 두 값 중 하나가 비어있으면 None.
+    """
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            text(
+                "SELECT sector, exchange_short_name FROM universe_tickers "
+                "WHERE symbol = :symbol "
+                "  AND universe_status = 'included' AND is_actively_trading = TRUE "
+                "LIMIT 1"
+            ),
+            {"symbol": ticker.upper()},
+        )
+        row = result.fetchone()
+
+    if row is None:
+        return None
+    sector, exchange = row[0], row[1]
+    if not sector or not exchange:
+        return None
+    return str(sector).strip(), str(exchange).strip()
+
+
+async def get_universe_stats_from_db() -> dict:
+    """
+    universe_tickers에서 전체 종목 수, 거래소별/섹터별 분포, snapshot_date 반환.
+    기존 ticker_store.get_universe_stats() 와 동일한 반환 구조 유지.
+    """
+    async with AsyncSessionLocal() as session:
+        r_total = await session.execute(
+            text(
+                "SELECT COUNT(*) FROM universe_tickers "
+                "WHERE universe_status = 'included'"
+            )
+        )
+        total: int = r_total.scalar() or 0
+
+        r_exchange = await session.execute(
+            text(
+                "SELECT exchange_short_name, COUNT(*) "
+                "FROM universe_tickers WHERE universe_status = 'included' "
+                "GROUP BY exchange_short_name ORDER BY COUNT(*) DESC"
+            )
+        )
+        by_exchange = {row[0]: row[1] for row in r_exchange.all() if row[0]}
+
+        r_sector = await session.execute(
+            text(
+                "SELECT sector, COUNT(*) "
+                "FROM universe_tickers "
+                "WHERE universe_status = 'included' "
+                "  AND sector IS NOT NULL AND sector != '' "
+                "GROUP BY sector ORDER BY COUNT(*) DESC"
+            )
+        )
+        by_sector = {row[0]: row[1] for row in r_sector.all() if row[0]}
+
+        r_snap = await session.execute(
+            text(
+                "SELECT snapshot_date FROM universe_tickers "
+                "WHERE universe_status = 'included' LIMIT 1"
+            )
+        )
+        snap_row = r_snap.fetchone()
+        snapshot_date = str(snap_row[0]) if snap_row and snap_row[0] else None
+
+    return {
+        "total": total,
+        "by_exchange": by_exchange,
+        "by_sector": by_sector,
+        "snapshot_date": snapshot_date,
+        "source_file": "supabase:universe_tickers",
+    }

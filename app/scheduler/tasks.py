@@ -181,16 +181,16 @@ celery_app.conf.update(
 # 티커 목록 — universe_current.csv 에서 로드
 # ──────────────────────────────────────────
 
-def load_all_tickers() -> list[str]:
+async def load_all_tickers() -> list[str]:
     """
-    universe_current.csv (build_universe 실행 결과) 에서
+    Supabase universe_tickers 테이블에서
     is_actively_trading=True, universe_status=included 종목만 반환.
 
-    유니버스가 아직 빌드되지 않았으면 빈 리스트 → 배치가 조용히 스킵됨.
-    유니버스 빌드: python -m app.universe.build_universe
+    DB가 비어있으면 빈 리스트 → 배치가 조용히 스킵됨.
+    DB 업로드: python scripts/upload_universe_to_supabase.py
     """
     from app.universe.ticker_store import get_universe_tickers
-    return get_universe_tickers()
+    return await get_universe_tickers()
 
 # ──────────────────────────────────────────
 # 핵심 배치 실행 함수 (공통)
@@ -205,7 +205,7 @@ async def run_digest_batch(digest_type: str):
     """
     logger.info(f"===== [{digest_type.upper()}] 배치 시작 =====")
 
-    tickers = load_all_tickers()
+    tickers = await load_all_tickers()
     since = get_since_datetime(digest_type)
 
     # 1. 뉴스 수집
@@ -268,7 +268,7 @@ async def run_daily_closing(test_tickers: list[str] | None = None):
         )
 
         since = et_now - timedelta(hours=24)
-        tickers = test_tickers if test_tickers else load_all_tickers()
+        tickers = test_tickers if test_tickers else await load_all_tickers()
         collector = FMPNewsCollector()
         news_by_ticker = await collector.fetch_all(
             all_tickers=tickers, since=since, limit_per_batch=50, concurrency=25,
@@ -339,7 +339,7 @@ async def run_daily_premarket(
             et_now.replace(hour=0, minute=0, second=0, microsecond=0)
             - timedelta(hours=3)
         )
-        tickers = test_tickers if test_tickers else load_all_tickers()
+        tickers = test_tickers if test_tickers else await load_all_tickers()
         collector = FMPNewsCollector()
         news_by_ticker = await collector.fetch_all(
             all_tickers=tickers, since=since, limit_per_batch=50, concurrency=25,
@@ -832,7 +832,7 @@ async def run_refresh_midterm_part_b(test_tickers: list[str] | None = None):
     CONCURRENCY = 10
     et_now = datetime.now(ET)
     week_monday = _week_monday(et_now.date())
-    tickers = test_tickers if test_tickers else load_all_tickers()
+    tickers = test_tickers if test_tickers else await load_all_tickers()
     total = len(tickers)
     logger.info(
         f"===== [REFRESH-MIDTERM-PART-B] 시작 "
@@ -962,10 +962,12 @@ def task_weekly_sector_news():
 
 @celery_app.task(name="tasks.weekly_midterm")
 def task_weekly_midterm():
-    et_now = datetime.now(ET)
-    week_monday = _week_monday(et_now.date())
-    tickers = load_all_tickers()
-    asyncio.run(run_midterm(tickers, week_monday))
+    async def _run():
+        et_now = datetime.now(ET)
+        week_monday = _week_monday(et_now.date())
+        tickers = await load_all_tickers()
+        await run_midterm(tickers, week_monday)
+    asyncio.run(_run())
 
 @celery_app.task(name="tasks.refresh_midterm_part_b")
 def task_refresh_midterm_part_b():
@@ -1049,12 +1051,16 @@ celery_app.conf.beat_schedule = {
 def task_build_universe():
     """
     FMP company-screener 기반으로 뉴스 수집 대상 유니버스를 빌드하고
-    data/universe/universe_current.csv 를 갱신한다.
+    Supabase universe_tickers 테이블에 upsert한다.
 
-    스케줄: 매주 일요일 새벽 2시 (장 마감 후 조용한 시간대)
+    스케줄: 매년 1월 1일 새벽 3시 ET (거래소 휴장일, 안전한 시간대)
     수동 실행: celery -A app.scheduler.tasks call tasks.build_universe
     """
+    import pandas as pd
+    from pathlib import Path as _Path
     from app.universe.universe_runner import run_universe_build, UniverseBuildConfig
+    from app.universe.universe_save import save_to_supabase
+
     config = UniverseBuildConfig(
         min_market_cap=settings.universe_min_market_cap,
         exchanges=settings.universe_exchanges,
@@ -1062,16 +1068,27 @@ def task_build_universe():
         profile_enrich_new_only=True,
     )
     result = run_universe_build(config)
+
     if result.success:
         logger.info(
             f"[UNIVERSE] 빌드 완료: {result.included_count}개 종목 | "
             f"snapshot={result.snapshot_date}"
         )
+        try:
+            csv_path = _Path(result.data_dir) / "universe_current.csv"
+            if csv_path.exists():
+                df = pd.read_csv(csv_path)
+                count = asyncio.run(save_to_supabase(df))
+                logger.info(f"[UNIVERSE] Supabase upsert 완료: {count}개 종목")
+            else:
+                logger.warning("[UNIVERSE] universe_current.csv 없음 — Supabase 업로드 스킵")
+        except Exception as e:
+            logger.error(f"[UNIVERSE] Supabase 업로드 실패: {e}")
     else:
         logger.error(f"[UNIVERSE] 빌드 실패: exit_code={result.exit_code}")
 
-# beat_schedule 에 universe 빌드 추가
-celery_app.conf.beat_schedule["universe-weekly"] = {
+# beat_schedule — 매년 1월 1일 03:00 ET (거래소 휴장일, 안전)
+celery_app.conf.beat_schedule["universe-yearly"] = {
     "task": "tasks.build_universe",
-    "schedule": crontab(hour=2, minute=0, day_of_week=0),  # 매주 일요일 02:00
+    "schedule": crontab(month_of_year=1, day_of_month=1, hour=3, minute=0),
 }

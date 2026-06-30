@@ -264,3 +264,17 @@ def save_outputs(
         "snapshot_date": snap,
         "created_at_utc": created,
     }
+
+
+async def save_to_supabase(included_df: pd.DataFrame) -> int:
+    """
+    included_df(포함 유니버스 DataFrame)를 Supabase universe_tickers 테이블에 upsert.
+    database.upsert_universe_tickers() 호출 — TRUNCATE + INSERT 방식.
+    반환값: upsert된 행 수.
+    """
+    from app.models.database import upsert_universe_tickers
+
+    rows = included_df.to_dict(orient="records")
+    count = await upsert_universe_tickers(rows)
+    log.info("save_to_supabase: %d rows upserted to universe_tickers", count)
+    return count

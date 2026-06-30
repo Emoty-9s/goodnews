@@ -104,6 +104,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
     )
+    p.add_argument(
+        "--upload-to-supabase",
+        action="store_true",
+        help=(
+            "빌드 완료 후 universe_tickers Supabase 테이블에 upsert. "
+            "python -m app.universe.build_universe 또는 프로젝트 루트에서 실행 필요"
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -127,7 +135,29 @@ def main() -> int:
     configure_logging(args.log_level, bool(args.debug))
     data_dir = Path(args.data_dir)
     try:
-        return run_universe_pipeline(args)
+        exit_code = run_universe_pipeline(args)
+
+        if exit_code == 0 and getattr(args, "upload_to_supabase", False):
+            import asyncio
+            import sys
+            import pandas as pd
+
+            # 프로젝트 루트를 sys.path에 추가 (직접 실행 시 app 패키지 접근 보장)
+            _proj_root = str(Path(__file__).resolve().parent.parent.parent)
+            if _proj_root not in sys.path:
+                sys.path.insert(0, _proj_root)
+
+            from universe_save import save_to_supabase
+
+            csv_path = data_dir / "universe_current.csv"
+            if csv_path.exists():
+                df = pd.read_csv(csv_path)
+                count = asyncio.run(save_to_supabase(df))
+                log.info("Supabase upload 완료: %d rows upserted", count)
+            else:
+                log.warning("universe_current.csv 없음 — Supabase 업로드 스킵")
+
+        return exit_code
     except Exception as e:
         log.exception("pipeline crashed: %s", type(e).__name__)
         if args.save_raw:

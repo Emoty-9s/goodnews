@@ -138,6 +138,56 @@ CREATE INDEX IF NOT EXISTS idx_macro_name_date
     ON macro_indicators (name, date DESC);
 
 
+-- ────────────────────────────────────────
+-- 7. universe_tickers
+--    FMP 유니버스 스냅샷 (연 1회 빌드, Supabase가 유일한 source-of-truth)
+--    운용: TRUNCATE + INSERT 방식으로 전체 교체. 개별 행 UPDATE는 아래 트리거로 updated_at 자동 갱신.
+-- ────────────────────────────────────────
+
+-- updated_at 자동 갱신 트리거 함수 (다른 테이블에도 재사용 가능)
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE IF NOT EXISTS universe_tickers (
+    symbol               TEXT          PRIMARY KEY,
+    company_name         TEXT,
+    exchange             TEXT,
+    exchange_short_name  TEXT,
+    country              TEXT,
+    currency             TEXT,
+    sector               TEXT,
+    industry             TEXT,
+    market_cap           FLOAT,
+    price                FLOAT,
+    beta                 FLOAT,
+    volume               FLOAT,
+    is_actively_trading  BOOLEAN,
+    universe_status      TEXT
+                           CHECK (universe_status IN ('included', 'excluded')),
+    snapshot_date        DATE,
+    created_at_utc       TIMESTAMPTZ   DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ   DEFAULT NOW()
+);
+
+-- symbol 은 이미 PK이나 명시적 UNIQUE INDEX 추가 (ORM 호환 + 문서화 목적)
+CREATE UNIQUE INDEX IF NOT EXISTS uix_universe_tickers_symbol
+    ON universe_tickers (symbol);
+
+CREATE INDEX IF NOT EXISTS idx_universe_tickers_status
+    ON universe_tickers (universe_status);
+
+-- 개별 UPDATE 시 updated_at 자동 갱신
+DROP TRIGGER IF EXISTS trg_universe_tickers_updated_at ON universe_tickers;
+CREATE TRIGGER trg_universe_tickers_updated_at
+    BEFORE UPDATE ON universe_tickers
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+
 -- ============================================================
 -- 보관 정책 요약 (코드 자동 삭제 기준)
 -- ============================================================

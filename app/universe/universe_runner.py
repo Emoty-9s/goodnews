@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.core.config import get_settings
-from app.universe.ticker_store import get_universe_tickers, get_universe_stats
+from app.universe.ticker_store import load_tickers_from_csv
 
 log = logging.getLogger(__name__)
 
@@ -115,16 +115,26 @@ def run_universe_build(config: Optional[UniverseBuildConfig] = None) -> Universe
         if _path_added and universe_pkg_dir in sys.path:
             sys.path.remove(universe_pkg_dir)
 
-    # 결과 취합
-    tickers = get_universe_tickers(config.data_dir / "universe_current.csv")
-    stats = get_universe_stats(config.data_dir / "universe_current.csv")
+    # 결과 취합 (빌드 직후이므로 CSV에서 직접 읽어 ORM 의존 없이 처리)
+    csv_path = config.data_dir / "universe_current.csv"
+    tickers = load_tickers_from_csv(csv_path)
+
+    snapshot_date: str | None = None
+    if csv_path.exists():
+        try:
+            import pandas as _pd
+            _df = _pd.read_csv(csv_path, usecols=["snapshot_date"], nrows=1)
+            if not _df.empty and "snapshot_date" in _df.columns:
+                snapshot_date = str(_df["snapshot_date"].iloc[0])
+        except Exception:
+            pass
 
     result = UniverseBuildResult(
         exit_code=exit_code,
-        included_count=stats.get("total", len(tickers)),
-        excluded_count=0,   # build_log.json 에서 읽을 수도 있지만 여기선 생략
+        included_count=len(tickers),
+        excluded_count=0,
         tickers=tickers,
-        snapshot_date=stats.get("snapshot_date"),
+        snapshot_date=snapshot_date,
         warnings=[],
         data_dir=str(config.data_dir.resolve()),
     )
