@@ -74,10 +74,9 @@ from app.summarizer.llm_summarizer import (
     summarize_ticker,
     summarize_weekly,
 )
-from app.universe.ticker_store import load_tickers_from_csv
+from app.universe.ticker_store import get_universe_tickers
 
 ET = ZoneInfo("America/New_York")
-UNIVERSE_CSV = ROOT / "data" / "universe" / "universe_current.csv"
 
 
 # ─── 유틸 ────────────────────────────────────────────────────────
@@ -539,9 +538,9 @@ async def main() -> None:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
         logger.info(f"지정 티커 {len(tickers)}개 사용")
     else:
-        tickers = load_tickers_from_csv(UNIVERSE_CSV)
+        tickers = await get_universe_tickers()
         if not tickers:
-            logger.error(f"universe_current.csv 없음 또는 비어 있음: {UNIVERSE_CSV}")
+            logger.error("Supabase universe_tickers 테이블이 비어있음. python scripts/upload_universe_to_supabase.py로 채워주세요.")
             sys.exit(1)
         logger.info(f"유니버스 {len(tickers):,}개 티커 로드")
 
