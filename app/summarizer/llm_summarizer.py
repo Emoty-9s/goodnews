@@ -1468,6 +1468,7 @@ def summarize_midterm(
     sector_name: str,
     exchange: str,
     sector_news: list[dict],
+    macro_data: str = "",
 ) -> dict | None:
     """
     중장기 리포트 생성.
@@ -1498,6 +1499,7 @@ def summarize_midterm(
     part_b_data = _generate_part_b_data(
         ticker, stock_cumulative, sp500_cumulative, sector_cumulative,
         alpha_vs_market, alpha_vs_sector, sector_name, exchange, sector_news,
+        macro_data=macro_data,
     )
     part_b_text = render_midterm_part_b(
         part_b_data, sector_name, exchange,

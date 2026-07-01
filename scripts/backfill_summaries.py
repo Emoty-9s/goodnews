@@ -49,7 +49,7 @@ from sqlalchemy import text
 from app.models.database import (
     AsyncSessionLocal,
     get_articles_for_ticker_between,
-    get_last_midterm_date,
+    get_latest_macro_snapshot,
     get_market_news_for_week,
     get_recent_weekly_finals_for_midterm,
     get_sector_news_series,
@@ -77,6 +77,40 @@ from app.summarizer.llm_summarizer import (
 from app.universe.ticker_store import get_universe_tickers
 
 ET = ZoneInfo("America/New_York")
+
+
+def _fmt_macro(snapshot: dict) -> str:
+    """get_latest_macro_snapshot() 반환값 → Part B 프롬프트용 텍스트."""
+    if not snapshot:
+        return "(거시 데이터 없음)"
+    LABEL: dict[str, tuple[str, str]] = {
+        "gdp":            ("GDP 성장률",       "분기"),
+        "cpi":            ("CPI 소비자물가",    "월간"),
+        "core_cpi":       ("Core CPI 근원물가", "월간"),
+        "ppi":            ("PPI 생산자물가",    "월간"),
+        "unemployment":   ("실업률",           "월간"),
+        "nfp":            ("비농업 고용(NFP)",  "월간"),
+        "fed_funds_rate": ("기준금리",         ""),
+        "treasury_10y":   ("10년 국채금리",    ""),
+        "ism_mfg":        ("ISM 제조업 PMI",   "월간"),
+        "ism_svc":        ("ISM 서비스업 PMI", "월간"),
+    }
+    lines = []
+    for key, (label, period) in LABEL.items():
+        d = snapshot.get(key)
+        if d is None:
+            continue
+        val = d.get("value")
+        prev = d.get("previous")
+        unit = d.get("unit", "%")
+        date_str = d.get("date", "")
+        change = ""
+        if val is not None and prev is not None:
+            diff = val - prev
+            change = f" (전월比 {diff:+.2f}{unit})"
+        period_str = f" [{period}]" if period else ""
+        lines.append(f"- {label}{period_str}: {val}{unit}{change} (기준일: {date_str})")
+    return "\n".join(lines)
 
 
 # ─── 유틸 ────────────────────────────────────────────────────────
@@ -322,6 +356,7 @@ async def phase3_midterm(
     today: date,
     semaphore: asyncio.Semaphore,
     stats: dict,
+    macro_data: str = "",
 ) -> None:
     print(f"\n[Phase 3] midterm 생성 시작: {len(tickers):,}개 종목")
     counter = _Counter(len(tickers))
@@ -329,15 +364,6 @@ async def phase3_midterm(
     async def _one_ticker(ticker: str) -> None:
         async with semaphore:
             try:
-                # 이미 midterm이 있으면 스킵
-                last_mid = await get_last_midterm_date(ticker)
-                if last_mid is not None and (today - _as_date(last_mid)).days < 7:
-                    stats["p3"]["skip"] += 1
-                    done, eta = counter.tick()
-                    if done % 100 == 0 or done == counter.total:
-                        print(f"[Phase 3] midterm 생성: 진행 {done:,}/{counter.total:,} | 남은 시간 {eta}")
-                    return
-
                 weekly_reports = await get_recent_weekly_finals_for_midterm(ticker, before=today)
                 if not weekly_reports:
                     stats["p3"]["skip"] += 1
@@ -368,6 +394,7 @@ async def phase3_midterm(
                     sector_name=sector_name,
                     exchange=exchange,
                     sector_news=sector_news,
+                    macro_data=macro_data,
                 )
                 if result is None:
                     logger.warning(f"[Phase 3][{ticker}] LLM 반환 None")
@@ -554,6 +581,11 @@ async def main() -> None:
 
     semaphore = asyncio.Semaphore(args.concurrency)
 
+    # 거시 데이터: Phase 3 Part B에서 공통 사용 — 한 번만 조회
+    macro_snapshot = await get_latest_macro_snapshot()
+    macro_data = _fmt_macro(macro_snapshot)
+    logger.info(f"거시 데이터 로드: {len(macro_snapshot)}개 지표")
+
     stats: dict = {
         "p1": _new_stats(), "p1_calls": 0,
         "p2": _new_stats(), "p2_calls": 0,
@@ -570,7 +602,7 @@ async def main() -> None:
         await phase2_sector_news(week_mondays, stats)
 
     if 3 in phases:
-        await phase3_midterm(tickers, today, semaphore, stats)
+        await phase3_midterm(tickers, today, semaphore, stats, macro_data=macro_data)
 
     if 4 in phases:
         await phase4_daily_overnight(tickers, today, semaphore, stats)
