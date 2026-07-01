@@ -350,7 +350,7 @@ Rules:
   or "이유:" — just state the reasoning directly.
 - Do not include citation numbers like ([1]), ([2]), ([3])
   in any field. Never reference source numbers.
-- positives/negatives/neutral_items: 각 항목은 {"content": "...", "category": "..."} 형태.
+- positives/negatives/neutral_items: 각 항목은 {{"content": "...", "category": "..."}} 형태.
   category는 다음 5개 중 정확히 하나: 실적_재무, 사업_운영, 시장평가, 경영_인사, 거시_섹터
 
   실적_재무: 어닝 비트/미스, 매출 증가/감소, 가이던스 상향/하향, 마진 변화
