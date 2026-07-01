@@ -21,8 +21,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-import pandas as pd
-
 from app.core.config import get_settings
 
 log = logging.getLogger(__name__)
@@ -53,6 +51,8 @@ def load_tickers_from_csv(
     -------
     대문자 티커 리스트. 파일이 없거나 빈 경우 빈 리스트.
     """
+    import pandas as pd
+
     p = Path(path)
     if not p.exists():
         log.warning(
@@ -101,6 +101,8 @@ def _load_universe_metadata_df(path: str) -> pd.DataFrame:
     universe_current.csv 에서 symbol / sector / exchange_short_name 만 로드 (캐시).
     included + is_actively_trading 필터 적용.
     """
+    import pandas as pd
+
     p = Path(path)
     if not p.exists():
         return pd.DataFrame(columns=["symbol", "sector", "exchange_short_name"])

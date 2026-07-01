@@ -32,3 +32,4 @@ python-dotenv==1.0.1
 requests==2.32.3
 urllib3==2.2.3
 pyarrow==18.0.0      # parquet 저장 (실패해도 CSV는 정상 동작)
+pandas>=2.0.0        # CSV 유니버스 로드 (load_tickers_from_csv)
