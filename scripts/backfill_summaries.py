@@ -357,6 +357,7 @@ async def phase3_midterm(
     semaphore: asyncio.Semaphore,
     stats: dict,
     macro_data: str = "",
+    all_week_mondays: list[date] | None = None,
 ) -> None:
     print(f"\n[Phase 3] midterm 생성 시작: {len(tickers):,}개 종목")
     counter = _Counter(len(tickers))
@@ -382,8 +383,9 @@ async def phase3_midterm(
 
                 sector_name, exchange = sector_info
                 week_mondays = [_as_date(r["week_monday"]) for r in weekly_reports]
-                benchmarks = await get_weekly_benchmarks_series(week_mondays, sector_name, exchange)
-                sector_news = await get_sector_news_series(sector_name, week_mondays)
+                _ref_weeks = all_week_mondays if all_week_mondays else week_mondays
+                benchmarks = await get_weekly_benchmarks_series(_ref_weeks, sector_name, exchange)
+                sector_news = await get_sector_news_series(sector_name, _ref_weeks)
 
                 result = await asyncio.to_thread(
                     summarize_midterm,
@@ -404,7 +406,7 @@ async def phase3_midterm(
                         print(f"[Phase 3] midterm 생성: 진행 {done:,}/{counter.total:,} | 남은 시간 {eta}")
                     return
 
-                report_date = max(week_mondays)
+                report_date = max(_ref_weeks)
                 await upsert_midterm(
                     ticker=ticker,
                     report_date=report_date,
@@ -602,7 +604,7 @@ async def main() -> None:
         await phase2_sector_news(week_mondays, stats)
 
     if 3 in phases:
-        await phase3_midterm(tickers, today, semaphore, stats, macro_data=macro_data)
+        await phase3_midterm(tickers, today, semaphore, stats, macro_data=macro_data, all_week_mondays=week_mondays)
 
     if 4 in phases:
         await phase4_daily_overnight(tickers, today, semaphore, stats)

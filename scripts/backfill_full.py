@@ -398,7 +398,7 @@ async def main() -> None:
         _p(f"  거시 데이터: {len(macro_snapshot)}개 지표 로드")
         semaphore = asyncio.Semaphore(args.concurrency)
         today = date.today()
-        await phase3_midterm(tickers, today, semaphore, stats, macro_data=macro_data)
+        await phase3_midterm(tickers, today, semaphore, stats, macro_data=macro_data, all_week_mondays=week_mondays)
     except Exception as e:
         _p(f"  midterm 생성 실패: {e}")
     _p(f"Step {current_step}/{total_steps} 완료 (소요: {_fmt_time(time.monotonic() - t_mid)})")
