@@ -389,8 +389,8 @@ class CheckpointSection(BaseModel):
     시장이 보고 있는 표면적 이유와 동시에 같이 챙겨봐야 할 사실을
     나란히 제시하는 섹션. 어느 쪽이 '맞다'는 판단은 하지 않는다.
     """
-    market_reaction: str | None = None
-    checkpoint: str | None = None
+    market_reaction: str | None
+    checkpoint: str | None
 
 
 class CategorizedItem(BaseModel):
@@ -400,14 +400,14 @@ class CategorizedItem(BaseModel):
 
 class FullReportData(BaseModel):
     headline: str
-    positives: list[CategorizedItem] = []
-    negatives: list[CategorizedItem] = []
-    neutral_items: list[CategorizedItem] = []
+    positives: list[CategorizedItem]
+    negatives: list[CategorizedItem]
+    neutral_items: list[CategorizedItem]
     context_note: str
-    checkpoint_section: CheckpointSection | None = None
+    checkpoint_section: CheckpointSection | None
     sentiment: str  # positive / negative / mixed / neutral
     sentiment_reason: str
-    next_watch: list[str] = []
+    next_watch: list[str]
 
 
 _SENTIMENT_TO_LABEL = {
@@ -499,14 +499,14 @@ WEEKLY_CATEGORIES = [
 class WeeklyReportData(BaseModel):
     headline: str
     weekly_flow: str
-    positives: list[CategorizedItem] = []
-    positives_interpretation: str | None = None
-    negatives: list[CategorizedItem] = []
-    negatives_interpretation: str | None = None
-    sentiment_start: str | None = None   # positive/negative/mixed/neutral, 주초
-    sentiment_end: str | None = None     # positive/negative/mixed/neutral, 주말
-    temperature_reason: str | None = None
-    next_watch: list[str] = []
+    positives: list[CategorizedItem]
+    positives_interpretation: str | None
+    negatives: list[CategorizedItem]
+    negatives_interpretation: str | None
+    sentiment_start: str | None   # positive/negative/mixed/neutral, 주초
+    sentiment_end: str | None     # positive/negative/mixed/neutral, 주말
+    temperature_reason: str | None
+    next_watch: list[str]
     sentiment: str            # 이번 주 종합 판단. positive/negative/mixed/neutral
     sentiment_reason: str
 
@@ -1160,15 +1160,15 @@ def parse_sector_sentiment(section: str) -> str:
 class MidtermPartAData(BaseModel):
     headline: str
     flow_narrative: str
-    trend_items: list[CategorizedItem] = []
-    trend_interpretation: str | None = None
+    trend_items: list[CategorizedItem]
+    trend_interpretation: str | None
 
 
 # ── Part B: 수치/판단 기반 스키마 ────────────────────────────
 class MidtermPartBData(BaseModel):
     benchmark_interpretation: str
-    sector_comparison: str | None = None
-    macro_analysis: str | None = None
+    sector_comparison: str | None
+    macro_analysis: str | None
     sentiment: str            # positive/negative/mixed/neutral
     sentiment_reason: str
 
