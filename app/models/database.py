@@ -792,6 +792,17 @@ async def delete_old_news_articles(days: int = 7) -> dict:
     }
 
 
+async def delete_articles_between(since: datetime, until: datetime) -> int:
+    """backfill 주차별 순환 처리 시 해당 주 articles 즉시 삭제."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            text("DELETE FROM articles WHERE published_at >= :since AND published_at < :until"),
+            {"since": since, "until": until},
+        )
+        await session.commit()
+    return result.rowcount or 0
+
+
 async def delete_closing_for_overnight(ticker: str, report_date: date) -> None:
     """
     overnight 리포트 생성 완료 후 같은 날짜의 closing 삭제.
