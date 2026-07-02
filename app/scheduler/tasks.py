@@ -61,6 +61,7 @@ from app.models.database import (
     get_sector_news_series,
     get_ticker_sector_exchange,
     get_tickers_with_news_between,
+    dispose_engine,
     get_unresolved_failures,
     get_weekly_benchmarks_series,
     get_weekly_draft,
@@ -1065,9 +1066,26 @@ async def run_refresh_midterm_part_b(test_tickers: list[str] | None = None):
 # Celery 태스크 정의
 # ──────────────────────────────────────────
 
+async def _run_and_dispose(coro):
+    """
+    코루틴 실행 후 (같은 이벤트 루프 안에서) DB 엔진 커넥션 풀을 비운다.
+    코루틴의 반환값은 그대로 전달한다.
+
+    asyncio.run()은 호출마다 새 이벤트 루프를 만들고 끝나면 닫지만, DB 엔진은
+    워커 프로세스 생애주기 동안 재사용된다. 풀에 남은 커넥션이 "닫힌 루프"에
+    귀속된 채로 다음 asyncio.run() 호출에 재사용되면 RuntimeError가 발생하므로,
+    모든 Celery 태스크는 asyncio.run(...) 대신 asyncio.run(_run_and_dispose(...))
+    으로 감싸 실행 직후 풀을 비운다.
+    """
+    try:
+        return await coro
+    finally:
+        await dispose_engine()
+
+
 @celery_app.task(name="tasks.daily_closing")
 def task_daily_closing():
-    asyncio.run(run_daily_closing())
+    asyncio.run(_run_and_dispose(run_daily_closing()))
 
 @celery_app.task(name="tasks.retry_failed_daily")
 def task_retry_failed_daily(
@@ -1082,23 +1100,25 @@ def task_retry_failed_daily(
     """
     report_date = date.fromisoformat(report_date_str) if report_date_str else date.today()
     since = datetime.fromisoformat(since_iso) if since_iso else None
-    asyncio.run(retry_failed_daily(report_date, since=since, pass_num=pass_num))
+    asyncio.run(_run_and_dispose(
+        retry_failed_daily(report_date, since=since, pass_num=pass_num)
+    ))
 
 @celery_app.task(name="tasks.daily_premarket")
 def task_daily_premarket():
-    asyncio.run(run_daily_premarket())
+    asyncio.run(_run_and_dispose(run_daily_premarket()))
 
 @celery_app.task(name="tasks.weekly_draft")
 def task_weekly_draft():
-    asyncio.run(run_weekly_draft())
+    asyncio.run(_run_and_dispose(run_weekly_draft()))
 
 @celery_app.task(name="tasks.weekly_final")
 def task_weekly_final():
-    asyncio.run(run_weekly_final())
+    asyncio.run(_run_and_dispose(run_weekly_final()))
 
 @celery_app.task(name="tasks.weekly_sector_news")
 def task_weekly_sector_news():
-    asyncio.run(run_weekly_sector_news())
+    asyncio.run(_run_and_dispose(run_weekly_sector_news()))
 
 @celery_app.task(name="tasks.weekly_midterm")
 def task_weekly_midterm():
@@ -1107,11 +1127,11 @@ def task_weekly_midterm():
         week_monday = _week_monday(et_now.date())
         tickers = await load_all_tickers()
         await run_midterm(tickers, week_monday)
-    asyncio.run(_run())
+    asyncio.run(_run_and_dispose(_run()))
 
 @celery_app.task(name="tasks.refresh_midterm_part_b")
 def task_refresh_midterm_part_b():
-    asyncio.run(run_refresh_midterm_part_b())
+    asyncio.run(_run_and_dispose(run_refresh_midterm_part_b()))
 
 
 @celery_app.task(name="tasks.macro_collect")
@@ -1124,12 +1144,12 @@ def task_macro_collect():
         count = await fetch_macro_indicators()
         deleted = await delete_old_macro_indicators(months=6)
         logger.info(f"[MACRO] 수집 {count}건, 삭제 {deleted}건")
-    asyncio.run(_run())
+    asyncio.run(_run_and_dispose(_run()))
 
 
 @celery_app.task(name="tasks.daily_digest")
 def task_daily_digest():
-    asyncio.run(run_digest_batch("daily"))
+    asyncio.run(_run_and_dispose(run_digest_batch("daily")))
 
 # ──────────────────────────────────────────
 # Celery Beat 스케줄 설정
@@ -1218,7 +1238,7 @@ def task_build_universe():
             csv_path = _Path(result.data_dir) / "universe_current.csv"
             if csv_path.exists():
                 df = pd.read_csv(csv_path)
-                count = asyncio.run(save_to_supabase(df))
+                count = asyncio.run(_run_and_dispose(save_to_supabase(df)))
                 logger.info(f"[UNIVERSE] Supabase upsert 완료: {count}개 종목")
             else:
                 logger.warning("[UNIVERSE] universe_current.csv 없음 — Supabase 업로드 스킵")

@@ -155,6 +155,21 @@ async def create_tables():
         await conn.run_sync(Base.metadata.create_all)
 
 
+async def dispose_engine() -> None:
+    """
+    엔진의 커넥션 풀을 비운다.
+
+    Celery 태스크는 매 실행마다 asyncio.run()으로 새 이벤트 루프를 만들고 끝나면
+    닫는데, 이 engine/AsyncSessionLocal은 워커 프로세스 생애주기 동안 모듈
+    레벨에서 한 번만 생성되어 계속 재사용된다. 풀에 남은 커넥션은 그걸 만든
+    이벤트 루프에 귀속되므로, 다음 asyncio.run() 호출(=새 루프)에서 그 커넥션을
+    재사용하려 하면 "attached to a different loop" 에러로 죽는다.
+    각 asyncio.run() 코루틴이 끝나는 시점(같은 루프 안에서)에 호출해
+    다음 호출이 완전히 새 커넥션으로 시작하게 만든다.
+    """
+    await engine.dispose()
+
+
 # ──────────────────────────────────────────
 # 내부 유틸
 # ──────────────────────────────────────────
