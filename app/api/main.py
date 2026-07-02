@@ -7,9 +7,15 @@ GoodNews AI - FastAPI 서버
   GET /health
 """
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, Query
+
+# httpx가 매 요청마다 INFO로 "HTTP Request: GET ..." 로그를 찍어
+# 수천 개 티커를 순회하는 배치 중 Railway 로그 rate limit에 걸려
+# 정작 필요한 에러 로그가 유실되는 것을 방지.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession

@@ -8,6 +8,7 @@ Celery 배치 스케줄러
 """
 
 import asyncio
+import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,6 +16,11 @@ from zoneinfo import ZoneInfo
 from celery import Celery
 from celery.schedules import crontab
 from loguru import logger
+
+# httpx가 매 요청마다 INFO로 "HTTP Request: GET ..." 로그를 찍어
+# 수천 개 티커를 순회하는 배치 중 Railway 로그 rate limit에 걸려
+# 정작 필요한 에러 로그가 유실되는 것을 방지.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from app.core.config import get_settings
 from app.core.alerting import send_alert
@@ -55,11 +61,14 @@ from app.models.database import (
     get_sector_news_series,
     get_ticker_sector_exchange,
     get_tickers_with_news_between,
+    get_unresolved_failures,
     get_weekly_benchmarks_series,
     get_weekly_draft,
     has_weekly_final,
     insert_articles,
     insert_market_news,
+    mark_failure_resolved,
+    record_fetch_failure,
     upsert_midterm,
     upsert_sector_news,
     upsert_summary,
@@ -210,11 +219,11 @@ async def run_digest_batch(digest_type: str):
 
     # 1. 뉴스 수집
     collector = FMPNewsCollector()
-    news_by_ticker = await collector.fetch_all(
+    news_by_ticker, _failed_tickers = await collector.fetch_all(
         all_tickers=tickers,
         since=since,
         limit_per_batch=50,
-        concurrency=25,
+        concurrency=15,
     )
 
     # 2. LLM 요약 + DB Upsert (비-daily 는 report_date=NULL, version=None)
@@ -270,9 +279,17 @@ async def run_daily_closing(test_tickers: list[str] | None = None):
         since = et_now - timedelta(hours=24)
         tickers = test_tickers if test_tickers else await load_all_tickers()
         collector = FMPNewsCollector()
-        news_by_ticker = await collector.fetch_all(
-            all_tickers=tickers, since=since, limit_per_batch=50, concurrency=25,
+        news_by_ticker, failed_tickers = await collector.fetch_all(
+            all_tickers=tickers, since=since, limit_per_batch=50, concurrency=15,
         )
+
+        if failed_tickers:
+            for ticker, err in failed_tickers.items():
+                await record_fetch_failure(ticker, "daily", today_et, err)
+            logger.warning(
+                f"[DAILY-CLOSING] FMP 수집 실패 {len(failed_tickers)}개 종목 "
+                f"→ fetch_failures 기록: {', '.join(sorted(failed_tickers))}"
+            )
 
         all_articles = [a for articles in news_by_ticker.values() for a in articles]
         inserted = await insert_articles(all_articles)
@@ -305,12 +322,120 @@ async def run_daily_closing(test_tickers: list[str] | None = None):
             success += 1
 
         _alert_summary("daily_closing", success, fail, total)
+
+        # 뉴스 수집 실패(429 등) 안전망 — 즉시 1차 재시도, 필요시 지연 재시도 예약
+        await retry_failed_daily(today_et, since=since, pass_num=1)
     except Exception as e:
         send_alert(
             title="🔥 daily_closing 오류",
             message=f"태스크 실행 중 예외 발생:\n{str(e)[:500]}",
         )
         raise
+
+# ──────────────────────────────────────────
+# Daily Phase1b: 뉴스 수집 실패(429 등) 재시도 안전망
+# ──────────────────────────────────────────
+
+RETRY_MAX_PASSES = 5
+# pass_num(진행한 회차) → 다음 pass 예약까지 대기 시간(초). Pass1은 즉시(0) 실행.
+RETRY_DELAY_SECONDS = {1: 300, 2: 600, 3: 1200, 4: 2400}
+
+
+async def retry_failed_daily(
+    report_date: date,
+    since: datetime | None = None,
+    pass_num: int = 1,
+) -> None:
+    """
+    daily-closing 뉴스 수집 실패(429 등, 재시도 소진) 티커만 다시 수집한다.
+
+    - Pass 1: run_daily_closing 종료 직후 즉시 호출.
+    - 여전히 미해결이면 Celery countdown으로 다음 pass 를 예약(+5/10/20/40분).
+    - 최대 RETRY_MAX_PASSES(5)회. 그 이후에도 미해결이면 최종 실패로 확정하고 ntfy 알림.
+
+    daily 전용 — weekly/midterm 은 대상 아님.
+    """
+    unresolved = await get_unresolved_failures("daily", report_date)
+    if not unresolved:
+        return
+
+    tickers = [u["ticker"] for u in unresolved]
+    logger.info(
+        f"[RETRY-DAILY][pass {pass_num}] {report_date} 미해결 {len(tickers)}개 재시도: "
+        f"{', '.join(tickers)}"
+    )
+
+    if since is None:
+        since = datetime.now(ET) - timedelta(hours=24)
+
+    collector = FMPNewsCollector()
+    news_by_ticker, failed_tickers = await collector.fetch_all(
+        all_tickers=tickers, since=since, limit_per_batch=50, concurrency=15,
+    )
+
+    resolved_count = 0
+    for ticker in tickers:
+        if ticker in failed_tickers:
+            await record_fetch_failure(ticker, "daily", report_date, failed_tickers[ticker])
+            continue
+
+        articles = news_by_ticker.get(ticker, [])
+        if articles:
+            await insert_articles(articles)
+            result = summarize_ticker(ticker, articles, "daily")
+            if result is not None:
+                await upsert_summary(
+                    ticker=ticker,
+                    digest_type="daily",
+                    report_date=report_date,
+                    version="closing",
+                    summary_text=result["summary_text"],
+                    sentiment=result["sentiment"],
+                    source_urls=result["source_urls"],
+                )
+            else:
+                logger.warning(
+                    f"[RETRY-DAILY][pass {pass_num}][{ticker}] "
+                    f"재수집 성공했으나 LLM 요약 실패 (fetch 문제는 해결됨)"
+                )
+        # 재수집 자체는 성공(뉴스 유무와 무관) → fetch_failures 상 해결 처리
+        await mark_failure_resolved(ticker, "daily", report_date)
+        resolved_count += 1
+
+    logger.info(
+        f"[RETRY-DAILY][pass {pass_num}] 완료: 해결 {resolved_count}개 / "
+        f"재실패 {len(failed_tickers)}개"
+    )
+
+    still_unresolved = await get_unresolved_failures("daily", report_date)
+    if not still_unresolved:
+        return
+
+    if pass_num >= RETRY_MAX_PASSES:
+        lines = [f"- {u['ticker']}: {u['last_error']}" for u in still_unresolved]
+        send_alert(
+            title=f"⚠️ daily-closing 최종 실패 {len(still_unresolved)}개",
+            message=(
+                f"{report_date} — {RETRY_MAX_PASSES}회 재시도 후에도 뉴스 수집 실패\n"
+                + "\n".join(lines)
+            ),
+        )
+        logger.error(
+            f"[RETRY-DAILY] {report_date} 최종 실패 확정: "
+            f"{len(still_unresolved)}개 ({RETRY_MAX_PASSES}회 재시도 소진)"
+        )
+        return
+
+    countdown = RETRY_DELAY_SECONDS[pass_num]
+    next_pass = pass_num + 1
+    task_retry_failed_daily.apply_async(
+        args=[report_date.isoformat(), since.isoformat(), next_pass],
+        countdown=countdown,
+    )
+    logger.info(
+        f"[RETRY-DAILY] pass {next_pass} 예약: +{countdown // 60}분 후 "
+        f"(미해결 {len(still_unresolved)}개)"
+    )
 
 # ──────────────────────────────────────────
 # Daily Phase2: Premarket (아침 8AM ET)
@@ -341,8 +466,8 @@ async def run_daily_premarket(
         )
         tickers = test_tickers if test_tickers else await load_all_tickers()
         collector = FMPNewsCollector()
-        news_by_ticker = await collector.fetch_all(
-            all_tickers=tickers, since=since, limit_per_batch=50, concurrency=25,
+        news_by_ticker, _failed_tickers = await collector.fetch_all(
+            all_tickers=tickers, since=since, limit_per_batch=50, concurrency=15,
         )
 
         all_articles = [a for articles in news_by_ticker.values() for a in articles]
@@ -943,6 +1068,21 @@ async def run_refresh_midterm_part_b(test_tickers: list[str] | None = None):
 @celery_app.task(name="tasks.daily_closing")
 def task_daily_closing():
     asyncio.run(run_daily_closing())
+
+@celery_app.task(name="tasks.retry_failed_daily")
+def task_retry_failed_daily(
+    report_date_str: str = None,
+    since_iso: str = None,
+    pass_num: int = 1,
+):
+    """
+    daily-closing 뉴스 수집 실패 안전망 — 지연 재시도(pass 2~5) 및 수동 실행용.
+
+    수동 실행: celery -A app.scheduler.tasks call tasks.retry_failed_daily --args='["2026-07-01"]'
+    """
+    report_date = date.fromisoformat(report_date_str) if report_date_str else date.today()
+    since = datetime.fromisoformat(since_iso) if since_iso else None
+    asyncio.run(retry_failed_daily(report_date, since=since, pass_num=pass_num))
 
 @celery_app.task(name="tasks.daily_premarket")
 def task_daily_premarket():

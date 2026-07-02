@@ -842,6 +842,80 @@ async def delete_draft_for_final(ticker: str, week_monday: date) -> None:
 
 
 # ──────────────────────────────────────────
+# fetch_failures — FMP 뉴스 수집 실패(429 등) 검증/재실행 안전망
+# ──────────────────────────────────────────
+
+async def record_fetch_failure(
+    ticker: str, digest_type: str, report_date: date, error_msg: str
+) -> None:
+    """
+    fetch_failures UPSERT. 이미 있으면 attempt_count += 1, last_error 갱신.
+    재실패이므로 resolved_at 은 NULL 로 리셋한다.
+    """
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            text(
+                """
+                INSERT INTO fetch_failures
+                    (ticker, digest_type, report_date, attempt_count, last_error, updated_at)
+                VALUES
+                    (:ticker, :digest_type, :report_date, 1, :error_msg, NOW())
+                ON CONFLICT (ticker, digest_type, report_date)
+                DO UPDATE SET
+                    attempt_count = fetch_failures.attempt_count + 1,
+                    last_error    = EXCLUDED.last_error,
+                    resolved_at   = NULL,
+                    updated_at    = NOW()
+                """
+            ),
+            {
+                "ticker": ticker.upper(),
+                "digest_type": digest_type,
+                "report_date": report_date,
+                "error_msg": error_msg,
+            },
+        )
+        await session.commit()
+
+
+async def get_unresolved_failures(digest_type: str, report_date: date) -> list[dict]:
+    """
+    해당 날짜의 미해결 실패 목록.
+    반환: [{"ticker":..., "attempt_count":..., "last_error":...}, ...]
+    """
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            text(
+                "SELECT ticker, attempt_count, last_error FROM fetch_failures "
+                "WHERE digest_type = :digest_type AND report_date = :report_date "
+                "  AND resolved_at IS NULL "
+                "ORDER BY ticker"
+            ),
+            {"digest_type": digest_type, "report_date": report_date},
+        )
+        rows = result.mappings().all()
+    return [dict(r) for r in rows]
+
+
+async def mark_failure_resolved(ticker: str, digest_type: str, report_date: date) -> None:
+    """재시도로 수집에 성공했을 때 호출 — resolved_at 을 현재 시각으로 채운다."""
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            text(
+                "UPDATE fetch_failures SET resolved_at = NOW(), updated_at = NOW() "
+                "WHERE ticker = :ticker AND digest_type = :digest_type "
+                "  AND report_date = :report_date"
+            ),
+            {
+                "ticker": ticker.upper(),
+                "digest_type": digest_type,
+                "report_date": report_date,
+            },
+        )
+        await session.commit()
+
+
+# ──────────────────────────────────────────
 # Midterm DB 함수
 # ──────────────────────────────────────────
 

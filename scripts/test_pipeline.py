@@ -26,11 +26,13 @@ async def test_fmp_api():
     from datetime import timezone
     since = get_since_datetime("daily")
 
-    news_by_ticker = await collector.fetch_all(
+    news_by_ticker, failed_tickers = await collector.fetch_all(
         all_tickers=["AAPL", "NVDA"],
         since=since,
         limit_per_batch=10,
     )
+    if failed_tickers:
+        print(f"  ⚠ 수집 실패: {failed_tickers}")
 
     for ticker, news_list in news_by_ticker.items():
         print(f"  ✓ {ticker}: {len(news_list)}건 수집")

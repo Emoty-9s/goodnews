@@ -12,10 +12,39 @@ GENERAL_NEWS_ENDPOINT = "https://financialmodelingprep.com/stable/news/general-l
 MAX_PAGES = 20  # 티커당 최대 페이지 (페이지당 limit 건)
 GENERAL_MAX_PAGES = 30  # 일반 뉴스 주간 수집용 (하루 ~75건 × 5일 ≈ 7페이지)
 
+# 429/5xx 재시도 설정 — exponential backoff: 2s → 4s → 8s
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+MAX_RETRIES = 3
+BACKOFF_BASE = 2
+
 
 class FMPNewsCollector:
     def __init__(self):
         self.api_key = settings.fmp_api_key
+
+    async def _fetch_page(self, client, semaphore, params):
+        """
+        단일 페이지 요청. 429/5xx 는 최대 MAX_RETRIES 회 재시도(exponential backoff).
+        그 외 HTTP 오류는 즉시 raise. 재시도 소진 시에도 raise (httpx.HTTPStatusError).
+        """
+        for attempt in range(MAX_RETRIES + 1):
+            async with semaphore:
+                response = await client.get(NEWS_ENDPOINT, params=params, timeout=30)
+
+            if response.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                wait = BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"FMP {response.status_code} "
+                    f"(ticker={params.get('symbols')}, page={params.get('page')}) "
+                    f"— {wait}초 후 재시도 ({attempt + 1}/{MAX_RETRIES})"
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            response.raise_for_status()
+            data = response.json()
+            await asyncio.sleep(0.3)
+            return data
 
     async def fetch_ticker(self, client, semaphore, ticker, from_date=None, limit=50):
         """
@@ -23,7 +52,8 @@ class FMPNewsCollector:
 
         symbols=<ticker> 1개만 보내므로 limit 이 해당 종목에만 적용된다.
         (배치로 보내면 limit 이 응답 전체에 적용돼 뒤쪽 종목이 누락됨)
-        반환: (ticker, 기사 리스트)
+        반환: (ticker, 기사 리스트, error) — error 는 재시도 소진 후에도 실패했을 때만
+        문자열(마지막 오류 메시지), 성공(빈 결과 포함) 시 None.
         """
         all_items = []
         seen_urls = set()
@@ -37,12 +67,8 @@ class FMPNewsCollector:
                 }
                 if from_date:
                     params["from"] = from_date
-                async with semaphore:
-                    response = await client.get(NEWS_ENDPOINT, params=params, timeout=30)
-                    response.raise_for_status()
-                    data = response.json()
-                    await asyncio.sleep(0.3)
 
+                data = await self._fetch_page(client, semaphore, params)
                 items = data if isinstance(data, list) else []
                 new_items = [i for i in items if i.get("url") not in seen_urls]
                 seen_urls.update(i.get("url") for i in new_items)
@@ -51,13 +77,19 @@ class FMPNewsCollector:
                 if len(items) < limit:
                     break
 
-            return ticker, all_items
+            return ticker, all_items, None
         except httpx.HTTPError as e:
-            logger.error(f"FMP API 오류 (ticker: {ticker}): {e}")
-            return ticker, []
+            logger.error(f"FMP API 오류 (ticker: {ticker}, 재시도 소진): {e}")
+            return ticker, all_items, str(e)
 
-    async def fetch_all(self, all_tickers, since=None, limit_per_batch=50, concurrency=25):
-        """모든 티커를 개별 요청으로 동시 수집 (limit_per_batch = 티커당 limit)."""
+    async def fetch_all(self, all_tickers, since=None, limit_per_batch=50, concurrency=15):
+        """
+        모든 티커를 개별 요청으로 동시 수집 (limit_per_batch = 티커당 limit).
+
+        반환: (news_by_ticker, failed_tickers)
+          news_by_ticker  : {ticker: [기사, ...]}  — 성공/부분성공 수집분(실패 전까지 모은 기사 포함)
+          failed_tickers  : {ticker: 마지막 오류 메시지}  — 재시도까지 소진하고 최종 실패한 티커
+        """
         logger.info(
             f"총 {len(all_tickers)}개 티커 개별 요청 시작 (동시 {concurrency})"
         )
@@ -75,15 +107,19 @@ class FMPNewsCollector:
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
         news_by_ticker = {}
+        failed_tickers: dict[str, str] = {}
         total = 0
         for result in results:
             if isinstance(result, Exception):
                 logger.warning(f"티커 수집 실패: {result}")
                 continue
-            ticker, items = result
+            ticker, items, error = result
             ticker = (ticker or "").upper()
             if not ticker:
                 continue
+
+            if error:
+                failed_tickers[ticker] = error
 
             kept = []
             for item in items:
@@ -105,8 +141,11 @@ class FMPNewsCollector:
                 news_by_ticker[ticker] = kept
                 total += len(kept)
 
-        logger.info(f"수집 완료: {len(news_by_ticker)}개 종목, 총 {total}건")
-        return news_by_ticker
+        logger.info(
+            f"수집 완료: {len(news_by_ticker)}개 종목, 총 {total}건"
+            + (f", 실패 {len(failed_tickers)}개" if failed_tickers else "")
+        )
+        return news_by_ticker, failed_tickers
 
 
 async def fetch_general_news(

@@ -188,6 +188,29 @@ CREATE TRIGGER trg_universe_tickers_updated_at
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 
+-- ────────────────────────────────────────
+-- 8. fetch_failures
+--    FMP 뉴스 수집 실패(429 등, 재시도 소진) 기록 — 검증/재실행 안전망
+--    digest_type 컬럼은 daily 외 weekly/midterm 향후 확장 대비 미리 둠
+-- ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS fetch_failures (
+    id             SERIAL        PRIMARY KEY,
+    ticker         VARCHAR(20)   NOT NULL,
+    digest_type    VARCHAR(20)   NOT NULL,
+    report_date    DATE          NOT NULL,
+    attempt_count  INT           NOT NULL DEFAULT 1,
+    last_error     TEXT,
+    resolved_at    TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    UNIQUE (ticker, digest_type, report_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fetch_failures_unresolved
+    ON fetch_failures (digest_type, report_date)
+    WHERE resolved_at IS NULL;
+
+
 -- ============================================================
 -- 보관 정책 요약 (코드 자동 삭제 기준)
 -- ============================================================
