@@ -306,7 +306,11 @@ async def run_daily_closing(test_tickers: list[str] | None = None):
             result = summarize_ticker(ticker, articles, "daily")
             if result is None:
                 fail += 1
-                logger.warning(f"[FAIL][daily_closing][{ticker}][{today_et}] LLM 반환 None")
+                logger.warning(f"[FAIL][daily_closing][{ticker}][{today_et}] LLM 반환 None — 재시도 대상 등록")
+                await record_fetch_failure(
+                    ticker, "daily", today_et,
+                    "LLM 요약 실패 (Gemini 503 재시도 소진) — fetch는 성공함",
+                )
                 if _check_abort("daily_closing", success, fail, total, ticker):
                     return
                 continue
@@ -381,27 +385,37 @@ async def retry_failed_daily(
             continue
 
         articles = news_by_ticker.get(ticker, [])
-        if articles:
-            await insert_articles(articles)
-            result = summarize_ticker(ticker, articles, "daily")
-            if result is not None:
-                await upsert_summary(
-                    ticker=ticker,
-                    digest_type="daily",
-                    report_date=report_date,
-                    version="closing",
-                    summary_text=result["summary_text"],
-                    sentiment=result["sentiment"],
-                    source_urls=result["source_urls"],
-                )
-            else:
-                logger.warning(
-                    f"[RETRY-DAILY][pass {pass_num}][{ticker}] "
-                    f"재수집 성공했으나 LLM 요약 실패 (fetch 문제는 해결됨)"
-                )
-        # 재수집 자체는 성공(뉴스 유무와 무관) → fetch_failures 상 해결 처리
-        await mark_failure_resolved(ticker, "daily", report_date)
-        resolved_count += 1
+        if not articles:
+            # 재수집 성공, 뉴스 없음까지 확인됨 → fetch_failures 상 해결 처리
+            await mark_failure_resolved(ticker, "daily", report_date)
+            resolved_count += 1
+            continue
+
+        await insert_articles(articles)
+        result = summarize_ticker(ticker, articles, "daily")
+        if result is not None:
+            await upsert_summary(
+                ticker=ticker,
+                digest_type="daily",
+                report_date=report_date,
+                version="closing",
+                summary_text=result["summary_text"],
+                sentiment=result["sentiment"],
+                source_urls=result["source_urls"],
+            )
+            await mark_failure_resolved(ticker, "daily", report_date)
+            resolved_count += 1
+        else:
+            # fetch는 성공했지만 요약 실패 — "해결"로 잘못 표시하면 리포트 없이
+            # 영구 누락되므로 미해결로 유지해 다음 pass에서 재시도되게 한다.
+            logger.warning(
+                f"[RETRY-DAILY][pass {pass_num}][{ticker}] "
+                f"fetch 성공, LLM 요약 실패 — 재시도 대상 유지"
+            )
+            await record_fetch_failure(
+                ticker, "daily", report_date,
+                "LLM 요약 실패 (Gemini 503 재시도 소진) — fetch는 성공함",
+            )
 
     logger.info(
         f"[RETRY-DAILY][pass {pass_num}] 완료: 해결 {resolved_count}개 / "
