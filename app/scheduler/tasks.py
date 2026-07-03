@@ -677,12 +677,16 @@ async def retry_failed_daily_premarket(
 # Weekly Phase1: Draft (월요일 8AM ET)
 # ──────────────────────────────────────────
 
+WEEKLY_DRAFT_CONCURRENCY = 3
+
+
 async def run_weekly_draft(test_tickers: list[str] | None = None):
     """
     월요일 8AM ET 실행 — 주간 초안 생성.
     - 이번 주 월요일을 report_date 로 사용
     - 지난 7일 일간 closing 리포트 조회 (부족하면 원본 뉴스 보완)
     - summarize_weekly() → weekly/draft Upsert
+      (Semaphore + asyncio.to_thread 로 병렬 처리)
     """
     try:
         et_now = datetime.now(ET)
@@ -706,47 +710,148 @@ async def run_weekly_draft(test_tickers: list[str] | None = None):
         logger.info(f"[WEEKLY-DRAFT] 대상 종목 {len(tickers)}개")
 
         total = len(tickers)
-        success = 0
-        fail = 0
-        for ticker in tickers:
-            dailies = await get_daily_reports(ticker, since_date, until_date)
-            raw = []
-            if len(dailies) < 3:
-                raw = await get_articles_for_ticker_between(ticker, since_dt, until_dt)
+        semaphore = asyncio.Semaphore(WEEKLY_DRAFT_CONCURRENCY)
+        stats = {"success": 0, "fail": 0}
+        abort_flag = [False]
 
-            # 요약할 데이터 자체가 없으면 실패가 아니라 스킵
-            if not dailies and not raw:
-                continue
-
-            summary = summarize_weekly(ticker, daily_reports=dailies, raw_articles=raw)
-            if summary is None:
-                fail += 1
-                logger.warning(
-                    f"[FAIL][weekly_draft][{ticker}][{week_monday}] "
-                    f"LLM 반환 None (daily {len(dailies)}건 / articles {len(raw)}건)"
-                )
-                if _check_abort("weekly_draft", success, fail, total, ticker):
+        async def _one(ticker: str) -> None:
+            async with semaphore:
+                if abort_flag[0]:
                     return
-                continue
+                dailies = await get_daily_reports(ticker, since_date, until_date)
+                raw = []
+                if len(dailies) < 3:
+                    raw = await get_articles_for_ticker_between(ticker, since_dt, until_dt)
 
-            await upsert_summary(
-                ticker=ticker,
-                digest_type="weekly",
-                report_date=week_monday,
-                version="draft",
-                summary_text=summary["summary_text"],
-                sentiment=summary["sentiment"],
-                source_urls=[],
-            )
-            success += 1
+                # 요약할 데이터 자체가 없으면 실패가 아니라 스킵
+                if not dailies and not raw:
+                    return
 
-        _alert_summary("weekly_draft", success, fail, total)
+                summary = await asyncio.to_thread(
+                    summarize_weekly, ticker, daily_reports=dailies, raw_articles=raw
+                )
+                if summary is None:
+                    stats["fail"] += 1
+                    logger.warning(
+                        f"[FAIL][weekly_draft][{ticker}][{week_monday}] "
+                        f"LLM 반환 None (daily {len(dailies)}건 / articles {len(raw)}건) "
+                        f"— 재시도 대상 등록"
+                    )
+                    await record_fetch_failure(
+                        ticker, "weekly_draft", week_monday,
+                        f"LLM 요약 실패 (daily {len(dailies)}건/articles {len(raw)}건 기반)",
+                    )
+                    if _check_abort(
+                        "weekly_draft", stats["success"], stats["fail"], total, ticker
+                    ):
+                        abort_flag[0] = True
+                    return
+
+                await upsert_summary(
+                    ticker=ticker,
+                    digest_type="weekly",
+                    report_date=week_monday,
+                    version="draft",
+                    summary_text=summary["summary_text"],
+                    sentiment=summary["sentiment"],
+                    source_urls=[],
+                )
+                await mark_failure_resolved(ticker, "weekly_draft", week_monday)
+                stats["success"] += 1
+
+        await asyncio.gather(*(_one(t) for t in tickers))
+
+        if abort_flag[0]:
+            return
+
+        _alert_summary("weekly_draft", stats["success"], stats["fail"], total)
+
+        # LLM 요약 실패 안전망 — 즉시 1차 재시도, 필요시 지연 재시도 예약
+        await retry_failed_weekly_draft(week_monday, pass_num=1)
     except Exception as e:
         send_alert(
             title="🔥 weekly_draft 오류",
             message=f"태스크 실행 중 예외 발생:\n{str(e)[:500]}",
         )
         raise
+
+# ──────────────────────────────────────────
+# Weekly Phase1b: Draft 요약 실패 재시도 안전망
+# ──────────────────────────────────────────
+
+
+async def retry_failed_weekly_draft(
+    report_date: date,
+    pass_num: int = 1,
+) -> None:
+    """
+    weekly-draft 요약 실패(Gemini 재시도 소진 등) 티커만 다시 요약한다.
+
+    FMP 뉴스 재수집이 필요 없다 — daily_reports/articles는 이미 DB에 있으므로
+    get_daily_reports/get_articles_for_ticker_between 로 재조회 후
+    summarize_weekly만 다시 호출한다 (retry_failed_daily류와의 차이점).
+
+    - Pass 1: run_weekly_draft 종료 직후 즉시 호출.
+    - 여전히 미해결이면 schedule_retry_or_alert가 다음 pass를 예약(+5/10/20/40분).
+    - 최대 RETRY_MAX_PASSES(5)회. 그 이후에도 미해결이면 최종 실패로 확정하고 ntfy 알림.
+    """
+    unresolved = await get_unresolved_failures("weekly_draft", report_date)
+    if not unresolved:
+        return
+
+    tickers = [u["ticker"] for u in unresolved]
+    logger.info(
+        f"[RETRY-WEEKLY-DRAFT][pass {pass_num}] {report_date} 미해결 {len(tickers)}개 재시도: "
+        f"{', '.join(tickers)}"
+    )
+
+    since_date = report_date - timedelta(days=7)
+    until_date = report_date
+    since_dt = _et_midnight(since_date)
+    until_dt = _et_midnight(until_date)
+
+    resolved_count = 0
+    for ticker in tickers:
+        dailies = await get_daily_reports(ticker, since_date, until_date)
+        raw = []
+        if len(dailies) < 3:
+            raw = await get_articles_for_ticker_between(ticker, since_dt, until_dt)
+
+        if not dailies and not raw:
+            # 요약할 데이터 자체가 없음 → 생성 대상이 아니므로 해결 처리
+            await mark_failure_resolved(ticker, "weekly_draft", report_date)
+            resolved_count += 1
+            continue
+
+        summary = summarize_weekly(ticker, daily_reports=dailies, raw_articles=raw)
+        if summary is not None:
+            await upsert_summary(
+                ticker=ticker,
+                digest_type="weekly",
+                report_date=report_date,
+                version="draft",
+                summary_text=summary["summary_text"],
+                sentiment=summary["sentiment"],
+                source_urls=[],
+            )
+            await mark_failure_resolved(ticker, "weekly_draft", report_date)
+            resolved_count += 1
+        else:
+            logger.warning(
+                f"[RETRY-WEEKLY-DRAFT][pass {pass_num}][{ticker}] "
+                f"LLM 요약 재시도 실패 — 재시도 대상 유지"
+            )
+            await record_fetch_failure(
+                ticker, "weekly_draft", report_date,
+                f"LLM 요약 실패 (daily {len(dailies)}건/articles {len(raw)}건 기반)",
+            )
+
+    logger.info(
+        f"[RETRY-WEEKLY-DRAFT][pass {pass_num}] 완료: 해결 {resolved_count}개 / "
+        f"재실패 {len(tickers) - resolved_count}개"
+    )
+
+    await schedule_retry_or_alert("weekly_draft", report_date, pass_num)
 
 # ──────────────────────────────────────────
 # Weekly Phase2: Final (금요일 9PM ET)
@@ -1291,7 +1396,8 @@ RETRY_HANDLERS: dict[str, Callable[[date, int], Awaitable[None]]] = {
     "daily_premarket": lambda report_date, pass_num: retry_failed_daily_premarket(
         report_date, pass_num=pass_num
     ),
-    # weekly/midterm은 각 Stage에서 여기 추가
+    "weekly_draft": retry_failed_weekly_draft,
+    # weekly_final/midterm은 각 Stage에서 여기 추가
 }
 
 
