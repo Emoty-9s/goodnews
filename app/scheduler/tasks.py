@@ -456,6 +456,9 @@ async def retry_failed_daily(
 # Daily Phase2: Premarket (아침 8AM ET)
 # ──────────────────────────────────────────
 
+DAILY_PREMARKET_CONCURRENCY = 3
+
+
 async def run_daily_premarket(
     test_tickers: list[str] | None = None,
     since_override: datetime | None = None,
@@ -464,6 +467,7 @@ async def run_daily_premarket(
     매일 아침 8AM ET 실행 (장 시작 전 업데이트).
     1) 전날 9PM ~ 오늘 새벽 뉴스 수집 → articles INSERT
     2) 새 뉴스 있는 종목만: 전날 closing 리포트 + 새 뉴스로 premarket 갱신
+       (Semaphore + asyncio.to_thread 로 병렬 처리)
 
     test_tickers 가 주어지면 해당 종목만 처리 (None 이면 전체 유니버스).
     since_override 는 테스트 전용 — 수집 시간창을 강제 지정한다.
@@ -481,9 +485,17 @@ async def run_daily_premarket(
         )
         tickers = test_tickers if test_tickers else await load_all_tickers()
         collector = FMPNewsCollector()
-        news_by_ticker, _failed_tickers = await collector.fetch_all(
+        news_by_ticker, failed_tickers = await collector.fetch_all(
             all_tickers=tickers, since=since, limit_per_batch=50, concurrency=15,
         )
+
+        if failed_tickers:
+            for ticker, err in failed_tickers.items():
+                await record_fetch_failure(ticker, "daily_premarket", today_et, err)
+            logger.warning(
+                f"[DAILY-PREMARKET] FMP 수집 실패 {len(failed_tickers)}개 종목 "
+                f"→ fetch_failures 기록: {', '.join(sorted(failed_tickers))}"
+            )
 
         all_articles = [a for articles in news_by_ticker.values() for a in articles]
         inserted = await insert_articles(all_articles)
@@ -493,42 +505,183 @@ async def run_daily_premarket(
 
         active = [(t, a) for t, a in news_by_ticker.items() if a]
         total = len(active)
-        success = 0
-        fail = 0
-        for ticker, new_articles in active:
-            closing = await get_closing_report(ticker, yesterday_et)
-            summary = summarize_update(
-                ticker=ticker,
-                existing_report=closing["summary_text"] if closing else None,
-                new_articles=new_articles,
-            )
-            if summary is None:
-                fail += 1
-                logger.warning(f"[FAIL][daily_premarket][{ticker}][{yesterday_et}] LLM 반환 None")
-                if _check_abort("daily_premarket", success, fail, total, ticker):
+        semaphore = asyncio.Semaphore(DAILY_PREMARKET_CONCURRENCY)
+        stats = {"success": 0, "fail": 0}
+        abort_flag = [False]
+
+        async def _one(ticker: str, new_articles: list[dict]) -> None:
+            async with semaphore:
+                if abort_flag[0]:
                     return
-                continue
+                closing = await get_closing_report(ticker, yesterday_et)
+                summary = await asyncio.to_thread(
+                    summarize_update,
+                    ticker=ticker,
+                    existing_report=closing["summary_text"] if closing else None,
+                    new_articles=new_articles,
+                )
+                if summary is None:
+                    stats["fail"] += 1
+                    logger.warning(
+                        f"[FAIL][daily_premarket][{ticker}][{yesterday_et}] "
+                        f"LLM 반환 None — 재시도 대상 등록"
+                    )
+                    await record_fetch_failure(
+                        ticker, "daily_premarket", today_et,
+                        "LLM 요약 실패 (Gemini 503 재시도 소진) — fetch는 성공함",
+                    )
+                    if _check_abort(
+                        "daily_premarket", stats["success"], stats["fail"], total, ticker
+                    ):
+                        abort_flag[0] = True
+                    return
 
-            await upsert_summary(
-                ticker=ticker,
-                digest_type="daily",
-                report_date=yesterday_et,
-                version="overnight",
-                summary_text=summary["summary_text"],
-                sentiment=summary["sentiment"],
-                source_urls=summary["source_urls"],
-            )
-            # overnight은 closing의 최종본 → 같은 날짜 closing 삭제
-            await delete_closing_for_overnight(ticker, yesterday_et)
-            success += 1
+                await upsert_summary(
+                    ticker=ticker,
+                    digest_type="daily",
+                    report_date=yesterday_et,
+                    version="overnight",
+                    summary_text=summary["summary_text"],
+                    sentiment=summary["sentiment"],
+                    source_urls=summary["source_urls"],
+                )
+                # overnight은 closing의 최종본 → 같은 날짜 closing 삭제
+                await delete_closing_for_overnight(ticker, yesterday_et)
+                stats["success"] += 1
 
-        _alert_summary("daily_premarket", success, fail, total)
+        await asyncio.gather(*(_one(t, a) for t, a in active))
+
+        if abort_flag[0]:
+            return
+
+        _alert_summary("daily_premarket", stats["success"], stats["fail"], total)
+
+        # 뉴스 수집(429 등) + LLM 요약 실패 안전망 — 즉시 1차 재시도, 필요시 지연 재시도 예약
+        await retry_failed_daily_premarket(today_et, since=since, pass_num=1)
     except Exception as e:
         send_alert(
             title="🔥 daily_premarket 오류",
             message=f"태스크 실행 중 예외 발생:\n{str(e)[:500]}",
         )
         raise
+
+# ──────────────────────────────────────────
+# Daily Phase2b: Premarket 실패(429/LLM) 재시도 안전망
+# ──────────────────────────────────────────
+
+
+async def retry_failed_daily_premarket(
+    report_date: date,
+    since: datetime | None = None,
+    pass_num: int = 1,
+) -> None:
+    """
+    daily-premarket 뉴스 수집(429 등) + LLM 요약 실패(재시도 소진) 티커만
+    다시 수집+요약한다. retry_failed_daily(closing)와 동일한 구조 —
+    digest_type='daily_premarket' 전용.
+
+    - Pass 1: run_daily_premarket 종료 직후 즉시 호출.
+    - 여전히 미해결이면 Celery countdown으로 다음 pass 를 예약(+5/10/20/40분).
+    - 최대 RETRY_MAX_PASSES(5)회. 그 이후에도 미해결이면 최종 실패로 확정하고 ntfy 알림.
+    """
+    unresolved = await get_unresolved_failures("daily_premarket", report_date)
+    if not unresolved:
+        return
+
+    tickers = [u["ticker"] for u in unresolved]
+    logger.info(
+        f"[RETRY-PREMARKET][pass {pass_num}] {report_date} 미해결 {len(tickers)}개 재시도: "
+        f"{', '.join(tickers)}"
+    )
+
+    yesterday = report_date - timedelta(days=1)
+    if since is None:
+        since = _et_midnight(report_date) - timedelta(hours=3)
+
+    collector = FMPNewsCollector()
+    news_by_ticker, failed_tickers = await collector.fetch_all(
+        all_tickers=tickers, since=since, limit_per_batch=50, concurrency=15,
+    )
+
+    resolved_count = 0
+    for ticker in tickers:
+        if ticker in failed_tickers:
+            await record_fetch_failure(
+                ticker, "daily_premarket", report_date, failed_tickers[ticker]
+            )
+            continue
+
+        articles = news_by_ticker.get(ticker, [])
+        if not articles:
+            # 재수집 성공, 새 뉴스 없음까지 확인됨 → fetch_failures 상 해결 처리
+            await mark_failure_resolved(ticker, "daily_premarket", report_date)
+            resolved_count += 1
+            continue
+
+        await insert_articles(articles)
+        closing = await get_closing_report(ticker, yesterday)
+        summary = summarize_update(
+            ticker=ticker,
+            existing_report=closing["summary_text"] if closing else None,
+            new_articles=articles,
+        )
+        if summary is not None:
+            await upsert_summary(
+                ticker=ticker,
+                digest_type="daily",
+                report_date=yesterday,
+                version="overnight",
+                summary_text=summary["summary_text"],
+                sentiment=summary["sentiment"],
+                source_urls=summary["source_urls"],
+            )
+            await delete_closing_for_overnight(ticker, yesterday)
+            await mark_failure_resolved(ticker, "daily_premarket", report_date)
+            resolved_count += 1
+        else:
+            logger.warning(
+                f"[RETRY-PREMARKET][pass {pass_num}][{ticker}] "
+                f"fetch 성공, LLM 요약 실패 — 재시도 대상 유지"
+            )
+            await record_fetch_failure(
+                ticker, "daily_premarket", report_date,
+                "LLM 요약 실패 (Gemini 503 재시도 소진) — fetch는 성공함",
+            )
+
+    logger.info(
+        f"[RETRY-PREMARKET][pass {pass_num}] 완료: 해결 {resolved_count}개 / "
+        f"재실패 {len(failed_tickers)}개"
+    )
+
+    still_unresolved = await get_unresolved_failures("daily_premarket", report_date)
+    if not still_unresolved:
+        return
+
+    if pass_num >= RETRY_MAX_PASSES:
+        lines = [f"- {u['ticker']}: {u['last_error']}" for u in still_unresolved]
+        send_alert(
+            title=f"⚠️ daily-premarket 최종 실패 {len(still_unresolved)}개",
+            message=(
+                f"{report_date} — {RETRY_MAX_PASSES}회 재시도 후에도 실패\n"
+                + "\n".join(lines)
+            ),
+        )
+        logger.error(
+            f"[RETRY-PREMARKET] {report_date} 최종 실패 확정: "
+            f"{len(still_unresolved)}개 ({RETRY_MAX_PASSES}회 재시도 소진)"
+        )
+        return
+
+    countdown = RETRY_DELAY_SECONDS[pass_num]
+    next_pass = pass_num + 1
+    task_retry_failed_daily_premarket.apply_async(
+        args=[report_date.isoformat(), since.isoformat(), next_pass],
+        countdown=countdown,
+    )
+    logger.info(
+        f"[RETRY-PREMARKET] pass {next_pass} 예약: +{countdown // 60}분 후 "
+        f"(미해결 {len(still_unresolved)}개)"
+    )
 
 # ──────────────────────────────────────────
 # Weekly Phase1: Draft (월요일 8AM ET)
@@ -1121,6 +1274,23 @@ def task_retry_failed_daily(
 @celery_app.task(name="tasks.daily_premarket")
 def task_daily_premarket():
     asyncio.run(_run_and_dispose(run_daily_premarket()))
+
+@celery_app.task(name="tasks.retry_failed_daily_premarket")
+def task_retry_failed_daily_premarket(
+    report_date_str: str = None,
+    since_iso: str = None,
+    pass_num: int = 1,
+):
+    """
+    daily-premarket 실패 안전망 — 지연 재시도(pass 2~5) 및 수동 실행용.
+
+    수동 실행: celery -A app.scheduler.tasks call tasks.retry_failed_daily_premarket --args='["2026-07-03"]'
+    """
+    report_date = date.fromisoformat(report_date_str) if report_date_str else date.today()
+    since = datetime.fromisoformat(since_iso) if since_iso else None
+    asyncio.run(_run_and_dispose(
+        retry_failed_daily_premarket(report_date, since=since, pass_num=pass_num)
+    ))
 
 @celery_app.task(name="tasks.weekly_draft")
 def task_weekly_draft():
