@@ -11,6 +11,7 @@ import asyncio
 import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 from celery import Celery
@@ -346,6 +347,51 @@ RETRY_MAX_PASSES = 5
 RETRY_DELAY_SECONDS = {1: 300, 2: 600, 3: 1200, 4: 2400}
 
 
+async def schedule_retry_or_alert(
+    task_type: str,
+    report_date: date,
+    pass_num: int,
+) -> None:
+    """
+    한 pass 실행 후 호출하는 공용 재시도 스케줄러.
+
+    미해결이 없으면 종료. pass_num < RETRY_MAX_PASSES 면 다음 pass를
+    tasks.retry_failed_report 로 +5/10/20/40분 예약. RETRY_MAX_PASSES(5)회
+    소진 시 ntfy 알림. daily/daily_premarket/향후 weekly/midterm 재시도
+    함수들이 공통으로 호출하는 진입점.
+    """
+    unresolved = await get_unresolved_failures(task_type, report_date)
+    if not unresolved:
+        return
+
+    if pass_num >= RETRY_MAX_PASSES:
+        lines = [f"- {u['ticker']}: {u['last_error']}" for u in unresolved]
+        send_alert(
+            title=f"⚠️ {task_type} 최종 실패 {len(unresolved)}개",
+            message=(
+                f"{report_date} — {RETRY_MAX_PASSES}회 재시도 후에도 실패\n"
+                + "\n".join(lines[:50])
+            ),
+        )
+        logger.error(
+            f"[RETRY][{task_type}] {report_date} 최종 실패 확정: "
+            f"{len(unresolved)}개 ({RETRY_MAX_PASSES}회 재시도 소진)"
+        )
+        return
+
+    countdown = RETRY_DELAY_SECONDS[pass_num]
+    next_pass = pass_num + 1
+    celery_app.send_task(
+        "tasks.retry_failed_report",
+        args=[task_type, report_date.isoformat(), next_pass],
+        countdown=countdown,
+    )
+    logger.info(
+        f"[RETRY][{task_type}] pass {next_pass} 예약: +{countdown // 60}분 후 "
+        f"(미해결 {len(unresolved)}개)"
+    )
+
+
 async def retry_failed_daily(
     report_date: date,
     since: datetime | None = None,
@@ -422,35 +468,7 @@ async def retry_failed_daily(
         f"재실패 {len(failed_tickers)}개"
     )
 
-    still_unresolved = await get_unresolved_failures("daily", report_date)
-    if not still_unresolved:
-        return
-
-    if pass_num >= RETRY_MAX_PASSES:
-        lines = [f"- {u['ticker']}: {u['last_error']}" for u in still_unresolved]
-        send_alert(
-            title=f"⚠️ daily-closing 최종 실패 {len(still_unresolved)}개",
-            message=(
-                f"{report_date} — {RETRY_MAX_PASSES}회 재시도 후에도 뉴스 수집 실패\n"
-                + "\n".join(lines)
-            ),
-        )
-        logger.error(
-            f"[RETRY-DAILY] {report_date} 최종 실패 확정: "
-            f"{len(still_unresolved)}개 ({RETRY_MAX_PASSES}회 재시도 소진)"
-        )
-        return
-
-    countdown = RETRY_DELAY_SECONDS[pass_num]
-    next_pass = pass_num + 1
-    task_retry_failed_daily.apply_async(
-        args=[report_date.isoformat(), since.isoformat(), next_pass],
-        countdown=countdown,
-    )
-    logger.info(
-        f"[RETRY-DAILY] pass {next_pass} 예약: +{countdown // 60}분 후 "
-        f"(미해결 {len(still_unresolved)}개)"
-    )
+    await schedule_retry_or_alert("daily", report_date, pass_num)
 
 # ──────────────────────────────────────────
 # Daily Phase2: Premarket (아침 8AM ET)
@@ -653,35 +671,7 @@ async def retry_failed_daily_premarket(
         f"재실패 {len(failed_tickers)}개"
     )
 
-    still_unresolved = await get_unresolved_failures("daily_premarket", report_date)
-    if not still_unresolved:
-        return
-
-    if pass_num >= RETRY_MAX_PASSES:
-        lines = [f"- {u['ticker']}: {u['last_error']}" for u in still_unresolved]
-        send_alert(
-            title=f"⚠️ daily-premarket 최종 실패 {len(still_unresolved)}개",
-            message=(
-                f"{report_date} — {RETRY_MAX_PASSES}회 재시도 후에도 실패\n"
-                + "\n".join(lines)
-            ),
-        )
-        logger.error(
-            f"[RETRY-PREMARKET] {report_date} 최종 실패 확정: "
-            f"{len(still_unresolved)}개 ({RETRY_MAX_PASSES}회 재시도 소진)"
-        )
-        return
-
-    countdown = RETRY_DELAY_SECONDS[pass_num]
-    next_pass = pass_num + 1
-    task_retry_failed_daily_premarket.apply_async(
-        args=[report_date.isoformat(), since.isoformat(), next_pass],
-        countdown=countdown,
-    )
-    logger.info(
-        f"[RETRY-PREMARKET] pass {next_pass} 예약: +{countdown // 60}분 후 "
-        f"(미해결 {len(still_unresolved)}개)"
-    )
+    await schedule_retry_or_alert("daily_premarket", report_date, pass_num)
 
 # ──────────────────────────────────────────
 # Weekly Phase1: Draft (월요일 8AM ET)
@@ -1291,6 +1281,35 @@ def task_retry_failed_daily_premarket(
     asyncio.run(_run_and_dispose(
         retry_failed_daily_premarket(report_date, since=since, pass_num=pass_num)
     ))
+
+# ──────────────────────────────────────────
+# 공용 재시도 레지스트리 — Stage 3 이후(weekly/midterm) 여기에 핸들러만 추가
+# ──────────────────────────────────────────
+
+RETRY_HANDLERS: dict[str, Callable[[date, int], Awaitable[None]]] = {
+    "daily": lambda report_date, pass_num: retry_failed_daily(report_date, pass_num=pass_num),
+    "daily_premarket": lambda report_date, pass_num: retry_failed_daily_premarket(
+        report_date, pass_num=pass_num
+    ),
+    # weekly/midterm은 각 Stage에서 여기 추가
+}
+
+
+@celery_app.task(name="tasks.retry_failed_report")
+def task_retry_failed_report(task_type: str, report_date_str: str, pass_num: int = 1):
+    """
+    schedule_retry_or_alert가 pass 2 이후를 예약할 때 쓰는 공용 진입점.
+
+    수동 실행: celery -A app.scheduler.tasks call tasks.retry_failed_report \
+        --args='["daily_premarket", "2026-07-03", 1]'
+    """
+    handler = RETRY_HANDLERS.get(task_type)
+    if handler is None:
+        logger.error(f"[RETRY] 알 수 없는 task_type: {task_type}")
+        return
+    report_date = date.fromisoformat(report_date_str)
+    asyncio.run(_run_and_dispose(handler(report_date, pass_num)))
+
 
 @celery_app.task(name="tasks.weekly_draft")
 def task_weekly_draft():
